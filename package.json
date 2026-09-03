@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "fastify": "^5.12.1",
+    "gpt-tokenizer": "^4.0.0",
     "ioredis": "^6.0.0",
     "pg": "^8.23.0",
     "undici": "^8.10.1",
