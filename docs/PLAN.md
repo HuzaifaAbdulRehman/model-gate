@@ -1,0 +1,191 @@
+# ModelGate build plan
+
+Working plan. Read `CLAUDE.md` first for what the project is and why it exists. This file
+only covers how it gets built and what has already been settled.
+
+Full research and citations live in `docs/RESEARCH.md`. That file is a working note, not
+prose for a reader.
+
+## Context
+
+ModelGate is a proxy between an app and LLM providers. It forwards requests, fails over
+when a provider dies, limits by token cost rather than request count, caches, and keeps an
+auditable log of every prompt and completion.
+
+It exists to demonstrate backend systems design for internship applications, which is the
+gap the rest of the portfolio does not cover. The bar: runs from a clean clone, one
+decision defensible for ten minutes, tests that fail when behaviour breaks, an honest
+README.
+
+Before any of it was written, a research sweep checked the assumptions the design rested
+on. Three claims went to adversarial reviewers and all three were overturned. They come
+first here, because they changed the build.
+
+## What the research overturned
+
+**Assistant-turn prefill cannot be the continuation mechanism.** Every current Claude model
+returns 400 with `"This model does not support assistant message prefill"`, confirmed
+across five unrelated repos. OpenAI never documented it at all. Groq documents prefill as
+output shaping, never as resuming a mid-sentence cut, and nobody has published evidence
+either way. Worse, Anthropic's own API reference still says prefill works, so the
+capability is not discoverable except by eating a 400.
+
+The portable primitive is a synthetic user turn: *your previous response was interrupted
+and ended with X, continue from there*. It needs no provider feature, so it works
+everywhere. Prefill becomes a capability flag on a hand-curated table, used only where
+verified against a live model.
+
+**Authoritative token usage from a stream is conditional, not a property.** It needs
+provider support, the opt-in flag, and a natural stream end. OpenAI documents plainly that
+an interrupted or cancelled stream may not deliver the usage chunk. Mid-stream failover and
+client abort are exactly those cases. So `token_source: 'estimated'` is the normal path for
+the headline feature, not an edge case, and the audit schema has to record which source
+every number came from.
+
+**Reserve-then-reconcile is correct under concurrency, not under crashes.** A crash between
+reserve and settle refunds tokens the provider genuinely generated, so the budget
+under-counts real consumption. That is an accuracy-for-liveness trade and has to be named
+as one. Two real bugs turned up in the proposed Lua before a line was written: an over-cap
+early return that silently destroys every reclaimed token, and a non-integer `est` that
+makes the limiter fail hard instead of open.
+
+The interview answer is *reserve-first eliminates concurrent-admission overshoot exactly;
+estimation error and crash-time refunds are the two residual inaccuracies, both bounded by
+one refill period*. Not "correct under crashes", which collapses on the first question.
+
+## Phases
+
+Ordered so that stopping after any phase still leaves a shippable project. That property is
+the point of the ordering, not an accident of it.
+
+| # | Phase | Done when |
+|---|---|---|
+| 0 | Foundations. TS + Fastify skeleton, Postgres and Redis via docker compose in WSL2, Zod-validated config, pino logging, Vitest, CI | clean clone, `docker compose up`, `npm test` passes, on steps that were actually run |
+| 1 | Mock provider, plus the Groq prefill experiment | every failure mode in `RESEARCH.md §1` is selectable by header and covered by a test |
+| 2 | Non-streaming proxy. Adapter and profile, retry, failover, token budget, exact-match cache, audit log | kill provider A mid-demo and the response still arrives from B. Demoable, resume-true |
+| 3 | Streaming passthrough. Framer, backpressure, abort, commit point. No token counting yet | byte-at-a-time framer test passes, TTFT at the client within 100ms of the mock's first token |
+| 4 | Token accounting through the stream. Three counters, reconciliation, `token_source` | per-delta re-encode is never used, reconciliation matches provider usage on a clean stream |
+| 5 | Mid-stream failover. Tier 1, then Tier 3, then Tier 2 timeboxed | zero duplicated characters at the seam, zero silent truncations, both asserted by tests |
+| 6 | Measurement, then the honest README | numbers in the README came from a script in the repo |
+
+Two changes from the brief's build order. Its stage 2 was one bullet hiding four
+subsystems, so it splits into phases 0 and 2 here. And the Groq prefill experiment moves up
+to phase 1: it costs an hour, and its answer decides whether Tier 2 has a prefill path at
+all. Finding that out at phase 5 would be a waste.
+
+### The three failover tiers
+
+**Tier 1, nothing flushed yet.** Clean failover. Provider B gets the original request
+verbatim, so there is no seam and no duplication. The commit-point design makes this the
+common case, covering connect failures, 5xx, 429 and TTFB timeouts. It ships alone as a
+complete feature.
+
+**Tier 3, bytes flushed and continuation impossible.** Terminate honestly with an in-band
+SSE error frame and `finish_reason: "modelgate_interrupted"`. About thirty lines. Never
+stop silently.
+
+**Tier 2, bytes flushed and continuable.** Best effort. Word-boundary write-behind buffer,
+synthetic user turn, overlap dedupe, exactly one attempt. Optional and timeboxed. If it
+does not work the README says continuation is not attempted, and the project is still
+strong, since that is OpenRouter's published position.
+
+The guarantee to defend is never duplicate, never silently truncate. Not seamlessness. The
+second model has no access to the first's sampling state, and no production gateway ships
+this: OpenRouter and Portkey decline it by design, Cloudflare's resumable streaming is
+same-provider reconnect, and LiteLLM's attempt has five open bugs.
+
+## Decisions already settled
+
+Detail and sources in `RESEARCH.md`.
+
+| Area | Decision |
+|---|---|
+| Framework | Fastify, with `reply.send(passThrough)` for SSE. Backpressure for free, plus a free client-disconnect signal. Not `hijack`, not bare `raw` |
+| HTTP client | `undici.request()` with a per-origin Pool. Not global fetch, because `bodyTimeout` is the inter-chunk idle timer and fetch cannot set it |
+| Provider shape | One OpenAI-wire adapter plus a `ProviderProfile` data object. Not two adapters, and not a class hierarchy |
+| Tokenizer | `gpt-tokenizer`, subpath imports, loaded eagerly at boot. Not WASM tiktoken, roughly 40× slower for this call pattern. No Llama path, since Llama left the Groq free tier |
+| Rate limiting | Token bucket with variable cost, two Lua scripts, ZSET leases pruned on reserve, settled-marker for idempotency |
+| Cache | Exact match on a hash of the normalized raw request. No semantic caching |
+| Redaction | One choke point behind a branded `Redacted` type, so passing a raw prompt is a type error rather than a code-review catch |
+| Ordering trap | Cache key over the raw prompt, audit record over the redacted one. Reversed, two prompts differing only by an email collide and you serve user A's completion to user B |
+| Infra | Docker Engine inside WSL2. Already running, no Docker Desktop, and `docker compose up` in the README stays literally true |
+| Providers | Mock through phases 1 to 5. Groq wired in at phase 6 for real numbers. The Azure key stays untouched |
+| Dependencies | `libphonenumber-js` and pino's `redact`. Nothing else for redaction, because the alternatives are abandoned, Python, or marketing |
+
+Not building: semantic caching, a reservation sweeper, Redis Functions, reversible PII
+tokenization, NER, `@fastify/sse`, `@fastify/reply-from`, `pg_partman`, auth beyond a
+static key, billing, public deployment. Each has a paragraph in `RESEARCH.md §9` saying
+why. "Here is where this would go and why I have not built it" is the stronger answer.
+
+## Rhythm
+
+Per phase, and the middle two steps are not optional.
+
+1. Plan. Agree scope, with nothing from the playbook loaded.
+2. Code. Written plain, no rules and no checklists. This is measured: agents handed the
+   backend rules up front shipped 0 of 3 working implementations, unaided agents shipped
+   3 of 3.
+3. Test. Tests written and run, real output shown, failures included.
+4. Review. Playbook checklist, only the sections the diff touches, then fixes applied.
+   Then Huzaifa reviews, with `/code-review ultra` where depth is worth paying for. The
+   same rules applied after the code exists found 47% of defects against 13% unaided.
+5. Commit. Incremental, explaining why. Subject under 50 characters. No AI attribution.
+
+Review ordering is currently playbook first, then Huzaifa. Worth flipping if seeing the raw
+mistakes is worth the slower pass.
+
+## Verification
+
+`npm test` runs unit and integration suites driven entirely by the mock provider, so no
+network and no keys. `docker compose up` then `npm run demo` kills a provider mid-request
+to watch failover. `npm run bench` produces the phase 6 numbers, reproducible from the
+repo.
+
+Three tests carry disproportionate weight:
+
+- **Byte-at-a-time framer.** Feed a known body one byte at a time, assert identical output.
+  It fails the instant someone optimises the decoder.
+- **Grep-the-whole-store redaction.** About thirty fake secrets through the full gateway,
+  then assert no fixture value appears in a `pg_dump`, the captured pino stream, or a Redis
+  dump. Per-field unit tests structurally cannot catch the leak this does.
+- **Two-tenant cache key.** Prompts identical except for an email. Assert the keys differ.
+
+## Carried forward from the phase 0 review
+
+Found by the playbook checklists, deliberately not built yet.
+
+**Partition maintenance does not exist.** The migration creates the current month and the
+two after it. Nothing creates more. A long-lived database eventually routes live traffic
+into the DEFAULT partition, and once rows sit there Postgres refuses to create a partition
+covering their range, so the repair becomes a data move rather than a DDL. A canary test
+asserts named partitions cover at least the next 30 days, so this fails loudly rather than
+silently. Clean clones and CI are unaffected because both migrate fresh.
+
+**Cache keys need a version prefix** when the cache arrives in phase 2. A shared Redis
+outlives every deploy, so without one, new code deserializes a payload the old code wrote.
+
+**The Dockerfile, when it exists, must use `CMD ["node", "dist/index.js"]`.** Not npm and
+not a shell form. Neither forwards SIGTERM, which would make the graceful shutdown in
+`src/index.ts` dead code while looking fine.
+
+**Bring the stack up with `docker compose up -d --wait`.** A bare `up -d` exits 0 as soon as
+containers are created, so a service crash-looping on bad config still reports success.
+
+**CI has never run.** The workflow is written and its shape matches HookRelay's working
+one, but GitHub Actions cannot be executed locally, so it stays unverified until the first
+push.
+
+## Open questions
+
+Does Groq prefill resume from a mid-sentence cut, or restart? Nobody has published this.
+Phase 1 experiment, twenty samples, and the answer goes in the README as an original
+finding.
+
+The gpt-oss chat framing constants are unverified. Calibrate them against
+`x_groq.debug.input_tokens`, then commit the fitted numbers with the date and method. Do
+not guess and call it fact.
+
+Client disconnect policy is unsettled. Either record `estimated` and abort upstream
+immediately, or drain upstream to capture usage. Currently leaning towards aborting:
+holding a provider connection open past the client's is a worse property for a gateway than
+a slightly drifted number.
