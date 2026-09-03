@@ -94,7 +94,12 @@ describe('GET /ready', () => {
   });
 
   it('503s and names Redis when the cache is unreachable', async () => {
-    const brokenCache = { ping: () => Promise.reject(new Error('down')) } as unknown as Redis;
+    // defineCommand is a no-op because the token budget registers its Lua on
+    // construction; only ping is meant to be broken here.
+    const brokenCache = {
+      ping: () => Promise.reject(new Error('down')),
+      defineCommand: () => undefined,
+    } as unknown as Redis;
     const app = buildServer({ config, db, cache: brokenCache, client });
 
     const res = await app.inject({ method: 'GET', url: '/ready' });

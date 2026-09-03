@@ -1,21 +1,22 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import type { FastifyInstance } from 'fastify';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config.js';
 import type { Db } from '../src/db.js';
 import { ProviderClient } from '../src/providers/client.js';
 import type { Cache } from '../src/redis.js';
 import { buildServer } from '../src/server.js';
+import { createTestRedis, waitForRedis } from './helpers/db.js';
 import { startMock, type RunningMock } from './helpers/mock.js';
 
-// The chat route does not touch Postgres or Redis yet; audit writes and the
-// token budget arrive in phase 2b. Stubbing them keeps these tests about
-// routing and failover, and they will be swapped for the real handles when
-// there is something to assert about them.
+// Redis is real, because the token budget now sits in the request path and a
+// stub would only prove that a stub was called. Postgres is still stubbed:
+// audit writes land later in this phase.
 const db = { query: () => Promise.resolve({ rows: [] }) } as unknown as Db;
-const cache = { ping: () => Promise.resolve('PONG') } as unknown as Cache;
+const cache: Cache = createTestRedis();
 
 const API_KEY = 'x'.repeat(24);
+const TENANT = 'default';
 
 interface Harness {
   app: FastifyInstance;
@@ -67,9 +68,21 @@ async function harness(
 
 let open: Harness | null = null;
 
+beforeAll(async () => {
+  await waitForRedis(cache);
+});
+
 afterEach(async () => {
   await open?.close();
   open = null;
+  // Each test starts with a full budget, or a later test fails for a reason
+  // that belongs to an earlier one.
+  const keys = await cache.keys(`mg:{t:${TENANT}}:*`);
+  if (keys.length > 0) await cache.del(...keys);
+});
+
+afterAll(async () => {
+  await cache.quit();
 });
 
 function chat(app: FastifyInstance, body: Record<string, unknown> = {}, key = API_KEY) {
@@ -259,6 +272,81 @@ describe('failover', () => {
     expect(res.headers['x-modelgate-provider']).toBe('mock-backup');
     // The primary is never reached, because the backup answered first.
     expect(open.primary.count()).toBe(0);
+  });
+});
+
+describe('token budget', () => {
+  it('refuses an impossible request with 400 rather than 429', async () => {
+    // 429 would tell the caller to retry something that can never fit, however
+    // long they wait.
+    open = await harness({ env: { TOKEN_BUDGET_CAP: '100' } });
+    const res = await chat(open.app);
+
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('request_exceeds_budget');
+    expect(open.primary.count()).toBe(0);
+  });
+
+  it('holds a reservation so concurrent requests cannot all pass', async () => {
+    // The property a post-hoc counter cannot give you. All three read the
+    // budget before any of them has finished spending it, so without a
+    // reservation all three would be admitted.
+    open = await harness({
+      env: { TOKEN_BUDGET_CAP: '2000', TOKEN_REFILL_PER_SEC: '1' },
+    });
+    const results = await Promise.all([chat(open.app), chat(open.app), chat(open.app)]);
+
+    expect(results.filter((r) => r.statusCode === 200).length).toBe(1);
+    const limited = results.filter((r) => r.statusCode === 429);
+    expect(limited.length).toBe(2);
+    expect(limited[0]?.headers['retry-after']).toBeDefined();
+    expect((limited[0]?.json() as { error: { code: string } }).error.code).toBe(
+      'token_budget_exhausted',
+    );
+  });
+
+  it('gives back the part of the reservation nobody used', async () => {
+    // The reservation covers max_tokens as a worst case, and a short answer
+    // must not go on costing the tenant the difference.
+    open = await harness();
+    const res = await chat(open.app);
+
+    expect(res.statusCode).toBe(200);
+    const remaining = Number(res.headers['x-modelgate-tokens-remaining']);
+    expect(remaining).toBeGreaterThan(99_000);
+    expect(remaining).toBeLessThan(100_000);
+  });
+
+  it('says whether the token count came from the provider or an estimate', async () => {
+    open = await harness();
+    const res = await chat(open.app);
+
+    expect(res.headers['x-modelgate-token-source']).toBe('provider');
+  });
+
+  it('returns the whole reservation when nothing was served', async () => {
+    open = await harness({ primaryFails: '429', backupFails: '429' });
+    const res = await chat(open.app);
+
+    expect(res.statusCode).toBe(502);
+    expect(Number(res.headers['x-modelgate-tokens-remaining'])).toBe(100_000);
+  });
+});
+
+describe('the chain deadline', () => {
+  it('stops rather than working through every provider', async () => {
+    // Each call is bounded on its own, but the worst case is providers times
+    // attempts times timeout. A caller should not wait all of that for a 502
+    // that became inevitable at the first provider.
+    open = await harness({
+      primaryFails: 'server-error',
+      env: { REQUEST_DEADLINE_MS: '1' },
+    });
+    const res = await chat(open.app);
+
+    expect(res.statusCode).toBe(502);
+    expect(res.headers['x-modelgate-attempts']).toBe('1');
+    expect(open.backup.count()).toBe(0);
   });
 });
 
