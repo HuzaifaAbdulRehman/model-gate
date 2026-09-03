@@ -47,6 +47,14 @@ const EnvSchema = z.object({
    */
   REQUEST_DEADLINE_MS: z.coerce.number().int().positive().default(60_000),
 
+  /**
+   * Exact match only. A prompt that differs by one character is a different
+   * question, and deciding when a merely similar prompt is NOT a hit is the
+   * interesting half of semantic caching that this does not attempt.
+   */
+  CACHE_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+  CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(300),
+
   /** Bucket size in tokens. Also the largest single request that can ever run. */
   TOKEN_BUDGET_CAP: z.coerce.number().int().positive().default(100_000),
   TOKEN_REFILL_PER_SEC: z.coerce.number().positive().default(2_000),

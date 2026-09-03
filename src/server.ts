@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify';
+import { CompletionCache } from './cache/completions.js';
 import type { Config } from './config.js';
 import type { Db } from './db.js';
 import { gatewayRoutes } from './gateway/routes.js';
@@ -68,6 +69,10 @@ export function buildServer({ config, db, cache, client }: ServerDeps): FastifyI
       capTokens: config.TOKEN_BUDGET_CAP,
       refillPerSec: config.TOKEN_REFILL_PER_SEC,
       leaseTtlMs: config.BUDGET_LEASE_TTL_MS,
+    }),
+    cache: new CompletionCache(cache, {
+      enabled: config.CACHE_ENABLED,
+      ttlSeconds: config.CACHE_TTL_SECONDS,
     }),
     deadlineMs: config.REQUEST_DEADLINE_MS,
     tenantId: DEFAULT_TENANT,

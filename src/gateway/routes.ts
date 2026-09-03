@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
+import type { CompletionCache } from '../cache/completions.js';
 import type { TokenBudget } from '../limits/budget.js';
 import type { ProviderClient } from '../providers/client.js';
 import type { ChatRequest, ProviderProfile } from '../providers/profile.js';
@@ -44,6 +45,7 @@ export interface GatewayDeps {
   maxAttemptsPerProvider: number;
   backoff: BackoffOptions;
   budget: TokenBudget;
+  cache: CompletionCache;
   deadlineMs: number;
   /**
    * A single static key means a single tenant. Mapping keys to tenants is the
@@ -122,6 +124,20 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
     }
 
     const chatRequest = parsed.data as ChatRequest;
+
+    // Looked up before the budget is touched, because a hit costs nothing
+    // upstream and charging a tenant's tokens for work no provider did would be
+    // charging them for the gateway's own memory.
+    const cacheKey = deps.cache.key(chatRequest, deps.tenantId);
+    const cached = await deps.cache.get(cacheKey);
+    if (cached.body !== null) {
+      return reply
+        .header('x-modelgate-cache', 'hit')
+        .header('x-modelgate-attempts', '0')
+        .code(200)
+        .send(cached.body);
+    }
+
     const requestId = randomUUID();
     const { prompt, reserve } = reservationFor(chatRequest);
 
@@ -198,8 +214,10 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
     void reply.header('x-modelgate-token-source', tokenSource);
 
     if (result.success !== null) {
+      await deps.cache.set(cacheKey, result.success.body);
       return reply
         .header('x-modelgate-provider', result.success.provider)
+        .header('x-modelgate-cache', 'miss')
         .code(200)
         .send(result.success.body);
     }
