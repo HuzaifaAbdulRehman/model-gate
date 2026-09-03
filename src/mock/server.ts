@@ -42,6 +42,15 @@ export interface MockOptions {
   logLevel?: string;
   /** Default dialect; a request may override it with `x-mock-dialect`. */
   dialect?: Dialect;
+  /**
+   * Applied when a request carries no `x-mock-fail` of its own.
+   *
+   * A gateway sends its own headers upstream, so a client cannot reach past it
+   * to fault one provider in a chain. Configuring the instance is how a
+   * failover test makes the first provider unhealthy and leaves the second
+   * working.
+   */
+  alwaysFail?: string;
 }
 
 function intHeader(value: string | string[] | undefined, fallback: number): number {
@@ -85,13 +94,13 @@ export function buildMockServer(options: MockOptions = {}): FastifyInstance {
 
     // parseFailure throws on an unrecognised mode, which surfaces as a 400 the
     // test sees rather than a silently healthy stream it does not.
+    const failHeader = Array.isArray(request.headers['x-mock-fail'])
+      ? request.headers['x-mock-fail'][0]
+      : request.headers['x-mock-fail'];
+
     let failure: Failure;
     try {
-      failure = parseFailure(
-        Array.isArray(request.headers['x-mock-fail'])
-          ? request.headers['x-mock-fail'][0]
-          : request.headers['x-mock-fail'],
-      );
+      failure = parseFailure(failHeader ?? options.alwaysFail);
     } catch (err) {
       return reply.code(400).send({
         error: { message: (err as Error).message, type: 'invalid_request_error', code: null },
@@ -117,6 +126,22 @@ export function buildMockServer(options: MockOptions = {}): FastifyInstance {
           type: 'invalid_request_error',
           code: null,
         },
+      });
+    }
+
+    if (failure.kind === 'bad-request') {
+      return reply.code(400).send({
+        error: {
+          message: 'unsupported value for parameter model',
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+    }
+
+    if (failure.kind === 'server-error') {
+      return reply.code(500).send({
+        error: { message: 'internal server error', type: 'server_error', code: null },
       });
     }
 
@@ -159,6 +184,27 @@ export function buildMockServer(options: MockOptions = {}): FastifyInstance {
       if (failure.kind === 'hang') {
         reply.hijack();
         return; // headers never sent; only a client-side timeout ends this
+      }
+
+      // Connection-level failures are not a streaming concern. A non-streaming
+      // call can have its socket dropped just as easily, and a mock that only
+      // broke streams would let the gateway's non-streaming error handling go
+      // untested.
+      if (failure.kind === 'abort' || failure.kind === 'fin') {
+        reply.hijack();
+        if (failure.kind === 'abort') reply.raw.destroy();
+        else reply.raw.socket?.end();
+        return;
+      }
+
+      if (failure.kind === 'truncate-json') {
+        reply.hijack();
+        reply.raw.writeHead(200, { 'content-type': 'application/json' });
+        await new Promise<void>((resolve) => {
+          reply.raw.write('{"id":"chatcmpl-', () => resolve());
+        });
+        reply.raw.socket?.end();
+        return;
       }
       const finishReason =
         failure.kind === 'length-stop' ? 'length'

@@ -4,6 +4,11 @@ import { buildMockServer, type MockOptions } from '../../src/mock/server.js';
 export interface RunningMock {
   app: FastifyInstance;
   url: string;
+  /**
+   * Requests this instance has served. Asserting it stayed at zero is the only
+   * way to prove a provider was skipped rather than tried and ignored.
+   */
+  count: () => number;
   close: () => Promise<void>;
 }
 
@@ -14,6 +19,11 @@ export interface RunningMock {
  */
 export async function startMock(options: MockOptions = {}): Promise<RunningMock> {
   const app = buildMockServer(options);
+  let served = 0;
+  app.addHook('onRequest', async () => {
+    served += 1;
+  });
+
   await app.listen({ port: 0, host: '127.0.0.1' });
   const address = app.server.address();
   if (address === null || typeof address === 'string') {
@@ -22,6 +32,7 @@ export async function startMock(options: MockOptions = {}): Promise<RunningMock>
   return {
     app,
     url: `http://127.0.0.1:${address.port}`,
+    count: () => served,
     close: () => app.close(),
   };
 }

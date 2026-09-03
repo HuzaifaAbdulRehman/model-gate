@@ -37,6 +37,13 @@ export const FAILURE_KINDS = [
   'noise',
   /** 429 with Groq-shaped headers, including a Go duration in the reset. */
   'rate-limit',
+  /**
+   * A 400 the provider blames on the request. Every provider would answer the
+   * same way, so this is the case a gateway must NOT fail over on.
+   */
+  'bad-request',
+  /** 500. Transient by nature, so worth another try at the same provider. */
+  'server-error',
   /** Fixed delay between frames, for backpressure and time-to-first-token work. */
   'slow',
   /** Tool call arguments split mid-escape and mid-UTF-8 character. */
