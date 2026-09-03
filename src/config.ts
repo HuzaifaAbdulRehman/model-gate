@@ -40,6 +40,19 @@ const EnvSchema = z.object({
   RETRY_BASE_MS: z.coerce.number().int().nonnegative().default(100),
   RETRY_CAP_MS: z.coerce.number().int().positive().default(2_000),
 
+  /**
+   * A ceiling on the whole chain. Without it the worst case is providers times
+   * attempts times timeout plus backoff, and a caller waits all of that for a
+   * 502 that was inevitable after the first provider.
+   */
+  REQUEST_DEADLINE_MS: z.coerce.number().int().positive().default(60_000),
+
+  /** Bucket size in tokens. Also the largest single request that can ever run. */
+  TOKEN_BUDGET_CAP: z.coerce.number().int().positive().default(100_000),
+  TOKEN_REFILL_PER_SEC: z.coerce.number().positive().default(2_000),
+  /** How long a reservation is held before the sweep reclaims it. */
+  BUDGET_LEASE_TTL_MS: z.coerce.number().int().positive().default(120_000),
+
   /** How long to wait for a provider to start answering. */
   PROVIDER_HEADERS_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
   /**
@@ -73,6 +86,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (config.PROVIDER_ORDER.includes('groq') && config.GROQ_API_KEY === undefined) {
     throw new Error(
       'Invalid environment:\n  GROQ_API_KEY is required when PROVIDER_ORDER includes groq',
+    );
+  }
+
+  // A lease reclaimed while its request is still running hands the tokens back
+  // to a tenant who is actively spending them, so the same budget gets issued
+  // twice. Two body timeouts is the shortest that is comfortably longer than a
+  // slow but healthy response.
+  if (config.BUDGET_LEASE_TTL_MS < config.PROVIDER_BODY_TIMEOUT_MS * 2) {
+    throw new Error(
+      `Invalid environment:\n  BUDGET_LEASE_TTL_MS (${config.BUDGET_LEASE_TTL_MS}) must be at least ` +
+        `twice PROVIDER_BODY_TIMEOUT_MS (${config.PROVIDER_BODY_TIMEOUT_MS}), or a reservation can be ` +
+        'reclaimed while the request holding it is still running',
     );
   }
 

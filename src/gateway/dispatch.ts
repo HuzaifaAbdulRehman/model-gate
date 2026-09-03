@@ -22,9 +22,18 @@ export interface DispatchOptions {
   apiKeys?: Readonly<Record<string, string | undefined>>;
   maxAttemptsPerProvider: number;
   backoff: BackoffOptions;
+  /**
+   * A ceiling on the whole chain, not on one call.
+   *
+   * Each provider call is bounded on its own, but the worst case is providers
+   * times attempts times timeout plus backoff, and a caller should not wait all
+   * of that for a 502 that became inevitable at the first provider.
+   */
+  deadlineMs?: number;
   signal?: AbortSignal | undefined;
   /** Injectable so retry tests do not spend the backoff in real time. */
   sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
 }
 
 export interface DispatchResult {
@@ -40,6 +49,24 @@ const TIMEOUT_CODES = new Set([
   'UND_ERR_CONNECT_TIMEOUT',
   'ETIMEDOUT',
 ]);
+
+/**
+ * Attributed to the gateway rather than to a provider, because no provider
+ * failed here. The chain simply ran out of time, and blaming whichever one was
+ * next would send someone debugging a healthy service.
+ */
+function deadlineFailure(elapsedMs: number): AttemptError {
+  return {
+    ok: false,
+    provider: 'modelgate',
+    disposition: 'failover',
+    status: null,
+    code: 'gateway_deadline_exceeded',
+    message: `the provider chain did not answer within the deadline (${elapsedMs}ms)`,
+    retryAfterMs: null,
+    latencyMs: elapsedMs,
+  };
+}
 
 function outcomeOf(failure: AttemptError): AttemptRecord['outcome'] {
   if (failure.status === 429) return 'rate_limited';
@@ -61,12 +88,22 @@ export async function dispatch(
   options: DispatchOptions,
 ): Promise<DispatchResult> {
   const sleep = options.sleep ?? ((ms: number) => delay(ms));
+  const now = options.now ?? Date.now;
+  const startedAt = now();
   const attempts: AttemptRecord[] = [];
   let lastFailure: AttemptError | null = null;
   let attemptNo = 0;
 
+  // Checked before starting an attempt rather than during one. Cutting a call
+  // that is already in flight would waste the work without saving the wait.
+  const outOfTime = (): boolean =>
+    options.deadlineMs !== undefined && now() - startedAt >= options.deadlineMs;
+
   for (const profile of options.providers) {
     for (let tries = 0; tries < options.maxAttemptsPerProvider; tries += 1) {
+      if (outOfTime()) {
+        return { success: null, failure: lastFailure ?? deadlineFailure(now() - startedAt), attempts };
+      }
       attemptNo += 1;
 
       const result = await options.client.call(profile, request, {

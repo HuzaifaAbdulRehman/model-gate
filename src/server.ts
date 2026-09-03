@@ -2,9 +2,17 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import type { Config } from './config.js';
 import type { Db } from './db.js';
 import { gatewayRoutes } from './gateway/routes.js';
+import { TokenBudget } from './limits/budget.js';
 import type { ProviderClient } from './providers/client.js';
 import { buildApiKeys, buildProviderChain } from './providers/registry.js';
 import type { Cache } from './redis.js';
+
+/**
+ * One static gateway key means one tenant. The budget underneath is already
+ * keyed by tenant, so mapping several keys to several tenants would change only
+ * the lookup, and building that now would be an auth system nobody asked for.
+ */
+const DEFAULT_TENANT = 'default';
 
 export interface ServerDeps {
   config: Config;
@@ -56,6 +64,13 @@ export function buildServer({ config, db, cache, client }: ServerDeps): FastifyI
     client,
     maxAttemptsPerProvider: config.MAX_ATTEMPTS_PER_PROVIDER,
     backoff: { baseMs: config.RETRY_BASE_MS, capMs: config.RETRY_CAP_MS },
+    budget: new TokenBudget(cache, {
+      capTokens: config.TOKEN_BUDGET_CAP,
+      refillPerSec: config.TOKEN_REFILL_PER_SEC,
+      leaseTtlMs: config.BUDGET_LEASE_TTL_MS,
+    }),
+    deadlineMs: config.REQUEST_DEADLINE_MS,
+    tenantId: DEFAULT_TENANT,
   });
 
   return app;
