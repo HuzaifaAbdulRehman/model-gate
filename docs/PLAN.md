@@ -150,6 +150,23 @@ Three tests carry disproportionate weight:
   dump. Per-field unit tests structurally cannot catch the leak this does.
 - **Two-tenant cache key.** Prompts identical except for an email. Assert the keys differ.
 
+## Carried forward from the phase 2a review
+
+**No total deadline across the chain.** Each provider call is bounded, but the worst case is
+providers times attempts times timeout, plus backoff. A caller can wait a long time for a
+502 that was inevitable after the first provider. Needs one deadline over the whole
+dispatch, checked between attempts. Phase 2b.
+
+**Undici's timeouts are coarse, and this is measured rather than assumed.** With
+`headersTimeout` set to 200ms, the first attempt actually failed at roughly 1.2 seconds and
+the chain reached the backup at 2.2 seconds. Sub-second values all land near a second. Use
+these timeouts for liveness only, never for a tight latency target, and remember it when
+phase 3 sets the inter-chunk idle timer.
+
+**The `x-modelgate-provider` header tells callers which provider served them.** Useful for
+the demo and for debugging a failover. It also publishes the provider chain to anyone with a
+key, which a real deployment would probably not want. Fine here, worth saying out loud.
+
 ## Carried forward from the phase 0 review
 
 Found by the playbook checklists, deliberately not built yet.
