@@ -1,15 +1,19 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import type { Config } from './config.js';
 import type { Db } from './db.js';
+import { gatewayRoutes } from './gateway/routes.js';
+import type { ProviderClient } from './providers/client.js';
+import { buildApiKeys, buildProviderChain } from './providers/registry.js';
 import type { Cache } from './redis.js';
 
 export interface ServerDeps {
   config: Config;
   db: Db;
   cache: Cache;
+  client: ProviderClient;
 }
 
-export function buildServer({ config, db, cache }: ServerDeps): FastifyInstance {
+export function buildServer({ config, db, cache, client }: ServerDeps): FastifyInstance {
   const app = Fastify({
     logger: { level: config.LOG_LEVEL },
   });
@@ -40,6 +44,18 @@ export function buildServer({ config, db, cache }: ServerDeps): FastifyInstance 
 
     const ready = postgres && redis;
     return reply.code(ready ? 200 : 503).send({ ready, postgres, redis });
+  });
+
+  // Registered as its own plugin so the bearer-token hook stays scoped to the
+  // gateway routes and never runs against the health probes, which have to
+  // answer an unauthenticated load balancer.
+  void app.register(gatewayRoutes, {
+    apiKey: config.GATEWAY_API_KEY,
+    providers: buildProviderChain(config),
+    apiKeys: buildApiKeys(config),
+    client,
+    maxAttemptsPerProvider: config.MAX_ATTEMPTS_PER_PROVIDER,
+    backoff: { baseMs: config.RETRY_BASE_MS, capMs: config.RETRY_CAP_MS },
   });
 
   return app;

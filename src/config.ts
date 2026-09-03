@@ -1,5 +1,8 @@
 import { z } from 'zod';
 
+const KNOWN_PROVIDERS = ['mock-primary', 'mock-backup', 'groq'] as const;
+export type ProviderName = (typeof KNOWN_PROVIDERS)[number];
+
 const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   HOST: z.string().min(1).default('0.0.0.0'),
@@ -10,6 +13,40 @@ const EnvSchema = z.object({
   DATABASE_URL: z.string().min(1),
   REDIS_URL: z.string().min(1),
   DB_POOL_MAX: z.coerce.number().int().positive().default(20),
+
+  /**
+   * Guards every gateway route. There is no default, because a shipped default
+   * key is worse than none: it looks like protection and is public knowledge.
+   */
+  GATEWAY_API_KEY: z.string().min(16),
+
+  /**
+   * Tried in order. The first that answers wins, so this is the failover chain
+   * rather than a set.
+   */
+  PROVIDER_ORDER: z
+    .string()
+    .default('mock-primary,mock-backup')
+    .transform((raw) => raw.split(',').map((name) => name.trim()).filter((name) => name !== ''))
+    .pipe(z.array(z.enum(KNOWN_PROVIDERS)).min(1)),
+
+  MOCK_PRIMARY_URL: z.string().url().default('http://127.0.0.1:3200'),
+  MOCK_BACKUP_URL: z.string().url().default('http://127.0.0.1:3201'),
+  GROQ_BASE_URL: z.string().url().default('https://api.groq.com'),
+  GROQ_API_KEY: z.string().min(1).optional(),
+
+  /** Per provider, not per request: the chain gets this many tries at each one. */
+  MAX_ATTEMPTS_PER_PROVIDER: z.coerce.number().int().positive().max(10).default(2),
+  RETRY_BASE_MS: z.coerce.number().int().nonnegative().default(100),
+  RETRY_CAP_MS: z.coerce.number().int().positive().default(2_000),
+
+  /** How long to wait for a provider to start answering. */
+  PROVIDER_HEADERS_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
+  /**
+   * The gap between chunks, not a total deadline. Undici defaults this to five
+   * minutes, which is indistinguishable from hanging forever.
+   */
+  PROVIDER_BODY_TIMEOUT_MS: z.coerce.number().int().positive().default(20_000),
 });
 
 export type Config = z.infer<typeof EnvSchema>;
@@ -28,5 +65,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`Invalid environment:\n${issues}`);
   }
 
-  return parsed.data;
+  const config = parsed.data;
+
+  // Groq in the chain without a key would fail every request routed to it with
+  // a 401, which the gateway would correctly treat as a reason to fail over.
+  // The chain would work and the misconfiguration would stay invisible.
+  if (config.PROVIDER_ORDER.includes('groq') && config.GROQ_API_KEY === undefined) {
+    throw new Error(
+      'Invalid environment:\n  GROQ_API_KEY is required when PROVIDER_ORDER includes groq',
+    );
+  }
+
+  if (config.RETRY_CAP_MS < config.RETRY_BASE_MS) {
+    throw new Error(
+      `Invalid environment:\n  RETRY_CAP_MS (${config.RETRY_CAP_MS}) must be at least ` +
+        `RETRY_BASE_MS (${config.RETRY_BASE_MS}), or the cap would clamp the first retry to less than the base`,
+    );
+  }
+
+  return config;
 }
