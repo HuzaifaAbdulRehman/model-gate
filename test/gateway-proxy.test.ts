@@ -75,9 +75,10 @@ beforeAll(async () => {
 afterEach(async () => {
   await open?.close();
   open = null;
-  // Each test starts with a full budget, or a later test fails for a reason
-  // that belongs to an earlier one.
-  const keys = await cache.keys(`mg:{t:${TENANT}}:*`);
+  // Each test starts with a full budget and an empty cache, or a later test
+  // fails for a reason that belongs to an earlier one. The cache keys are not
+  // under the tenant hash tag, so they need their own sweep.
+  const keys = [...(await cache.keys(`mg:{t:${TENANT}}:*`)), ...(await cache.keys('mg:cache:*'))];
   if (keys.length > 0) await cache.del(...keys);
 });
 
@@ -272,6 +273,75 @@ describe('failover', () => {
     expect(res.headers['x-modelgate-provider']).toBe('mock-backup');
     // The primary is never reached, because the backup answered first.
     expect(open.primary.count()).toBe(0);
+  });
+});
+
+describe('caching', () => {
+  it('serves a repeat request without calling a provider', async () => {
+    open = await harness();
+    const first = await chat(open.app);
+    const second = await chat(open.app);
+
+    expect(first.headers['x-modelgate-cache']).toBe('miss');
+    expect(second.headers['x-modelgate-cache']).toBe('hit');
+    expect(second.json()).toEqual(first.json());
+    expect(open.primary.count()).toBe(1);
+  });
+
+  it('costs no tokens on a hit', async () => {
+    // A hit did no upstream work, so charging the tenant's budget for it would
+    // be charging them for the gateway's own memory.
+    open = await harness();
+    await chat(open.app);
+    const before = await cache.hget(`mg:{t:${TENANT}}:tb:all`, 'tk');
+    await chat(open.app);
+    const after = await cache.hget(`mg:{t:${TENANT}}:tb:all`, 'tk');
+
+    expect(after).toBe(before);
+  });
+
+  it('treats a different prompt as a different question', async () => {
+    open = await harness();
+    await chat(open.app);
+    const other = await chat(open.app, { messages: [{ role: 'user', content: 'different' }] });
+
+    expect(other.headers['x-modelgate-cache']).toBe('miss');
+    expect(open.primary.count()).toBe(2);
+  });
+
+  it('ignores the order fields were written in', async () => {
+    open = await harness();
+    await chat(open.app, { temperature: 0.5 });
+    const reordered = await open.app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+      payload: {
+        temperature: 0.5,
+        messages: [{ role: 'user', content: 'hello' }],
+        model: 'mock-1',
+      },
+    });
+
+    expect(reordered.headers['x-modelgate-cache']).toBe('hit');
+  });
+
+  it('does not store a failed response', async () => {
+    open = await harness({ primaryFails: '429', backupFails: '429' });
+    expect((await chat(open.app)).statusCode).toBe(502);
+    const retry = await chat(open.app);
+
+    expect(retry.statusCode).toBe(502);
+    expect(retry.headers['x-modelgate-cache']).toBeUndefined();
+  });
+
+  it('can be turned off', async () => {
+    open = await harness({ env: { CACHE_ENABLED: 'false' } });
+    await chat(open.app);
+    const second = await chat(open.app);
+
+    expect(second.headers['x-modelgate-cache']).toBe('miss');
+    expect(open.primary.count()).toBe(2);
   });
 });
 
