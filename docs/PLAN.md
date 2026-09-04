@@ -150,6 +150,28 @@ Three tests carry disproportionate weight:
   dump. Per-field unit tests structurally cannot catch the leak this does.
 - **Two-tenant cache key.** Prompts identical except for an email. Assert the keys differ.
 
+## Measured in phase 4, correcting the research
+
+`RESEARCH.md` says counting each delta separately over-counts by 28% to 287%. Measured here
+with `gpt-tokenizer` on `o200k_base`, the truth is conditional:
+
+| Delta shape | per-delta | prefix re-encode | over-count |
+|---|---|---|---|
+| Word-aligned English | 5 | 5 | 0% |
+| Emoji | 8 | 8 | 0% |
+| Japanese characters | 8 | 5 | 60% |
+| One word split across deltas | 4 | 2 | 100% |
+
+So per-delta counting is not reliably wrong, it is *unreliable*: identical to the correct
+answer when a provider happens to chunk on token boundaries, and badly wrong when it does
+not. Since a gateway cannot choose how a provider chunks, the prefix re-encode is the only
+count that holds either way. That argument is stronger than the one in the research, and it
+is the one to give in an interview.
+
+It also had a consequence for the tests. The mock's deltas were word-aligned, so no
+end-to-end test could tell a correct counter from a broken one. The mock now has a
+`splitDeltas` mode that cuts words in half, and the accounting test runs against it.
+
 ## Carried forward from the phase 3 review
 
 **Backpressure is implemented but not directly tested.** The relay waits on
