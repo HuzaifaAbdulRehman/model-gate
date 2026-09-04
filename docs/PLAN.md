@@ -150,6 +150,26 @@ Three tests carry disproportionate weight:
   dump. Per-field unit tests structurally cannot catch the leak this does.
 - **Two-tenant cache key.** Prompts identical except for an email. Assert the keys differ.
 
+## Carried forward from the phase 3 review
+
+**Backpressure is implemented but not directly tested.** The relay waits on
+`drain` with the abort signal attached, which is the part that matters: `drain` never fires
+on a destroyed stream, so an unsignalled wait deadlocks the moment a client hangs up. What
+is missing is a test with a deliberately slow reader asserting the gateway's memory stays
+bounded. Worth adding at phase 6, where the measurement harness already exists.
+
+**Streaming has no failover.** It uses the first provider and stops. The commit point is
+built and the relay reports whether anything was flushed, so Tier 1 is a small step from
+here, but it is phase 5 work and pretending otherwise would be a lie in the README.
+
+**In-stream token counting is one frame, one token.** Cheap and roughly right, and it is
+labelled `estimated` everywhere it lands. Phase 4 replaces it with a periodic exact
+re-encode reconciled against the provider's usage frame.
+
+**A rate limit now passes through as 429 rather than 502.** Changed during this phase after
+reflection, not to make a test pass. 502 says the upstream is broken and invites an alert;
+429 with a retry-after says the quota is spent and says when to come back.
+
 ## Carried forward from the phase 2a review
 
 **No total deadline across the chain.** Each provider call is bounded, but the worst case is
