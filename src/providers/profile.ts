@@ -51,6 +51,14 @@ export interface ProviderProfile {
    * turn.
    */
   rejectCombos: ReadonlyArray<(request: ChatRequest) => string | null>;
+  /**
+   * Whether to ask for a usage frame on a stream.
+   *
+   * Not universal. Groq does not document `stream_options`, it is absent from
+   * their SDK types, and they report usage under `x_groq` regardless, so
+   * sending it there risks an unexplained 400 in exchange for nothing.
+   */
+  sendStreamOptions: boolean;
   /** Where this provider puts usage. Never assume the top level. */
   extractUsage: (body: unknown) => Usage | null;
   parseRateLimitHeaders: (headers: Record<string, string | string[] | undefined>) => RateLimitSnapshot;
@@ -146,6 +154,7 @@ export function mockProfile(
     dropParams: [],
     forceParams: {},
     rejectCombos: [],
+    sendStreamOptions: true,
     extractUsage: usageFromBody,
     parseRateLimitHeaders: openAiStyleRateLimits,
     timeouts,
@@ -172,6 +181,7 @@ export function groqProfile(
           ? 'groq rejects response_format together with streaming'
           : null,
     ],
+    sendStreamOptions: false,
     extractUsage: usageFromBody,
     parseRateLimitHeaders: openAiStyleRateLimits,
     // Groq documents 498 as retryable and 499 as never retryable, which is the

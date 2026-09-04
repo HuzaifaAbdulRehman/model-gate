@@ -25,6 +25,15 @@ export interface AttemptError extends AttemptFailure {
 
 export type AttemptResult = AttemptSuccess | AttemptError;
 
+/** A live upstream stream. Nothing has been read from it yet. */
+export interface StreamOpen {
+  ok: true;
+  provider: string;
+  status: number;
+  body: AsyncIterable<Uint8Array>;
+  latencyMs: number;
+}
+
 export interface CallOptions {
   apiKey?: string | undefined;
   signal?: AbortSignal | undefined;
@@ -124,6 +133,94 @@ export class ProviderClient {
         status: null,
         code: errorCode(err),
         message: (err as Error).message ?? 'provider call failed',
+        retryAfterMs: null,
+        latencyMs: now() - started,
+      };
+    }
+  }
+
+  /**
+   * Opens a streaming call and hands back the body without reading it.
+   *
+   * Separate from `call` because the interesting moment is different: here the
+   * result is a live socket, and whether the request succeeded is not yet known
+   * when this returns. Only the headers have arrived.
+   */
+  async openStream(
+    profile: ProviderProfile,
+    request: ChatRequest,
+    options: CallOptions = {},
+  ): Promise<StreamOpen | AttemptError> {
+    const now = options.now ?? Date.now;
+    const started = now();
+
+    const shaped = shapeRequest(profile, request);
+    if ('reject' in shaped) {
+      return {
+        ok: false,
+        provider: profile.name,
+        disposition: 'fatal',
+        status: 400,
+        code: 'unsupported_combination',
+        message: shaped.reject,
+        retryAfterMs: null,
+        latencyMs: 0,
+      };
+    }
+
+    const body: ChatRequest = { ...shaped.body, stream: true };
+    if (profile.sendStreamOptions) {
+      body['stream_options'] = { include_usage: true };
+    }
+
+    try {
+      const response = await this.#pool(profile.origin).request({
+        path: profile.path,
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'text/event-stream',
+          ...profile.authHeader(options.apiKey),
+        },
+        body: JSON.stringify(body),
+        headersTimeout: profile.timeouts.headers,
+        bodyTimeout: profile.timeouts.body,
+        ...(options.signal !== undefined ? { signal: options.signal } : {}),
+      });
+
+      if (response.statusCode >= 400) {
+        // Reading it to the end is not optional. An unconsumed body holds its
+        // socket open, and enough leaked sockets look exactly like a provider
+        // outage.
+        const text = await response.body.text();
+        const limits = profile.parseRateLimitHeaders(response.headers);
+        return {
+          ok: false,
+          provider: profile.name,
+          disposition: classifyStatus(response.statusCode, profile),
+          status: response.statusCode,
+          code: providerErrorCode(text) ?? `http_${response.statusCode}`,
+          message: providerErrorMessage(text) ?? text.slice(0, 200),
+          retryAfterMs: limits.resetMs,
+          latencyMs: now() - started,
+        };
+      }
+
+      return {
+        ok: true,
+        provider: profile.name,
+        status: response.statusCode,
+        body: response.body,
+        latencyMs: now() - started,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        provider: profile.name,
+        disposition: classifyError(err),
+        status: null,
+        code: errorCode(err),
+        message: (err as Error).message ?? 'provider stream failed to open',
         retryAfterMs: null,
         latencyMs: now() - started,
       };
