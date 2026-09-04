@@ -15,6 +15,7 @@ const config = loadConfig({
   // Long enough to satisfy the minimum and deliberately free of entropy, so a
   // secret scanner never has to decide whether this one is real.
   GATEWAY_API_KEY: 'x'.repeat(24),
+  REDACTION_PEPPER: 'p'.repeat(32),
 });
 
 const db: pg.Pool = createTestPool();

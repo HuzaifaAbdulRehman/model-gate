@@ -6,6 +6,7 @@ const required = {
   REDIS_URL: 'redis://localhost:6380',
   // No entropy on purpose, so a secret scanner never has to judge it.
   GATEWAY_API_KEY: 'x'.repeat(24),
+  REDACTION_PEPPER: 'p'.repeat(32),
 };
 
 describe('loadConfig', () => {

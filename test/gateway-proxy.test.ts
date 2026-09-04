@@ -6,13 +6,14 @@ import type { Db } from '../src/db.js';
 import { ProviderClient } from '../src/providers/client.js';
 import type { Cache } from '../src/redis.js';
 import { buildServer } from '../src/server.js';
-import { createTestRedis, waitForRedis } from './helpers/db.js';
+import { createTestPool, createTestRedis, truncateAll, waitForRedis } from './helpers/db.js';
+import { TEST_DATABASE_URL } from './helpers/global-setup.js';
 import { startMock, type RunningMock } from './helpers/mock.js';
 
-// Redis is real, because the token budget now sits in the request path and a
-// stub would only prove that a stub was called. Postgres is still stubbed:
-// audit writes land later in this phase.
-const db = { query: () => Promise.resolve({ rows: [] }) } as unknown as Db;
+// Both dependencies are real. Stubbing either would only prove that a stub was
+// called, and the audit write in particular fails quietly by design, so a stub
+// would hide a broken write rather than surface it.
+const db: Db = createTestPool();
 const cache: Cache = createTestRedis();
 
 const API_KEY = 'x'.repeat(24);
@@ -38,9 +39,10 @@ async function harness(
   const config = loadConfig({
     NODE_ENV: 'test',
     LOG_LEVEL: 'silent',
-    DATABASE_URL: 'postgres://modelgate:modelgate@localhost:5433/modelgate',
+    DATABASE_URL: TEST_DATABASE_URL,
     REDIS_URL: 'redis://localhost:6380',
     GATEWAY_API_KEY: API_KEY,
+    REDACTION_PEPPER: 'p'.repeat(32),
     MOCK_PRIMARY_URL: primary.url,
     MOCK_BACKUP_URL: backup.url,
     // Retries still happen; they just do not spend real time doing it.
@@ -80,10 +82,12 @@ afterEach(async () => {
   // under the tenant hash tag, so they need their own sweep.
   const keys = [...(await cache.keys(`mg:{t:${TENANT}}:*`)), ...(await cache.keys('mg:cache:*'))];
   if (keys.length > 0) await cache.del(...keys);
+  await truncateAll(db);
 });
 
 afterAll(async () => {
   await cache.quit();
+  await db.end();
 });
 
 function chat(app: FastifyInstance, body: Record<string, unknown> = {}, key = API_KEY) {
