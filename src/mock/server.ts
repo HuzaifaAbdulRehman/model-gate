@@ -51,6 +51,15 @@ export interface MockOptions {
    * working.
    */
   alwaysFail?: string;
+  /**
+   * Emit each piece as two deltas, cutting words in half.
+   *
+   * Real providers do not all chunk on token boundaries, and a gateway cannot
+   * choose how they chunk. With word-aligned deltas, counting each delta and
+   * re-encoding the whole prefix give identical answers, so a test built only
+   * on aligned output cannot tell a correct counter from a broken one.
+   */
+  splitDeltas?: boolean;
 }
 
 function intHeader(value: string | string[] | undefined, fallback: number): number {
@@ -173,7 +182,19 @@ export function buildMockServer(options: MockOptions = {}): FastifyInstance {
       crlf: request.headers['x-mock-crlf'] !== undefined,
     };
 
-    const pieces = [...contentPieces(seed, tokenCount)];
+    const whole = [...contentPieces(seed, tokenCount)];
+    const pieces =
+      options.splitDeltas === true
+        ? whole.flatMap((piece) => {
+            // Split by code point, not by UTF-16 index, or the halves cut an
+            // astral character in two and the text no longer round-trips.
+            const points = [...piece];
+            const at = Math.max(1, Math.floor(points.length / 2));
+            return [points.slice(0, at).join(''), points.slice(at).join('')].filter(
+              (part) => part !== '',
+            );
+          })
+        : whole;
     const usage: Usage = {
       prompt_tokens: estimatePromptTokens(body.messages),
       completion_tokens: pieces.length,
