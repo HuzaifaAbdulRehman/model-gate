@@ -392,7 +392,7 @@ describe('token budget', () => {
   it('gives back the part of the reservation nobody used', async () => {
     // The reservation covers max_tokens as a worst case, and a short answer
     // must not go on costing the tenant the difference.
-    open = await harness();
+    open = await harness({ env: { TOKEN_REFILL_PER_SEC: '1' } });
     const res = await chat(open.app);
 
     expect(res.statusCode).toBe(200);
