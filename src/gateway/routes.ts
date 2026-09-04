@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from 'fastify';
+import { PassThrough } from 'node:stream';
+import type { FastifyInstance, FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
+import { relayStream, type RelayResult } from '../streaming/relay.js';
 import { ENGINE_VERSION, type Redactor } from '../audit/redact.js';
 import type { AuditRecord, AuditWriter } from '../audit/writer.js';
 import type { CompletionCache } from '../cache/completions.js';
@@ -9,6 +11,7 @@ import type { ProviderClient } from '../providers/client.js';
 import type { ChatRequest, ProviderProfile } from '../providers/profile.js';
 import { countTokens, reservationFor } from '../tokens/counter.js';
 import { apiKeyMatches, bearerToken } from './auth.js';
+import type { Disposition } from '../providers/errors.js';
 import { dispatch, type AttemptRecord, type DispatchResult } from './dispatch.js';
 import type { BackoffOptions } from './backoff.js';
 
@@ -51,6 +54,15 @@ export interface GatewayDeps {
   audit: AuditWriter;
   redactor: Redactor;
   deadlineMs: number;
+  /**
+   * How long to hold the headers waiting for a first content delta.
+   *
+   * The trade is the whole reason the commit point exists. Waiting keeps a
+   * clean HTTP error available for longer; committing early gets bytes moving
+   * sooner. Time to first token is the number a streaming API is judged on, so
+   * this cannot be large.
+   */
+  commitDeadlineMs: number;
   /**
    * A single static key means a single tenant. Mapping keys to tenants is the
    * obvious extension and is left out on purpose: the budget below is already
@@ -100,6 +112,243 @@ function completionText(result: DispatchResult): string {
   return typeof content === 'string' ? content : '';
 }
 
+export type ScheduleAudit = (
+  partial: Pick<AuditRecord, 'outcome' | 'finalProvider' | 'cacheResult' | 'tokenSource'> & {
+    estPromptTokens?: number | null;
+    promptTokens?: number | null;
+    completionTokens?: number | null;
+    rawCompletion?: string | null;
+    attempts?: readonly AttemptRecord[];
+  },
+) => void;
+
+/**
+ * The status to answer with once no provider could serve the request.
+ *
+ * A rate limit is passed through rather than flattened into a 502. The two ask
+ * the caller for different things: 502 says the upstream is broken and invites
+ * an alert, while 429 with a retry-after says the quota is spent and tells them
+ * exactly when to come back. Reporting a saturated provider as a fault sends
+ * someone debugging a healthy service.
+ */
+function statusForFailure(failure: { disposition: Disposition; status: number | null }): number {
+  if (failure.disposition === 'fatal') return failure.status ?? 400;
+  if (failure.status === 429) return 429;
+  return 502;
+}
+
+/** How a stream ended, in the vocabulary the audit table uses. */
+function outcomeForAudit(result: RelayResult): AuditRecord['outcome'] {
+  switch (result.outcome) {
+    case 'complete':
+      return 'ok';
+    case 'truncated_clean':
+      return 'truncated';
+    case 'client_gone':
+      return 'client_abort';
+    default:
+      // Committed means the caller already has part of an answer, so the
+      // request was truncated rather than simply failed. Uncommitted means they
+      // got a clean error and nothing else.
+      return result.committed ? 'truncated' : 'failed';
+  }
+}
+
+/**
+ * The streaming path.
+ *
+ * The shape that matters: nothing is written to the client until the relay
+ * judges the stream live. Up to that point a clean HTTP error is still
+ * available, and past it the status is already 200 and every failure has to
+ * travel inside the stream.
+ */
+async function streamCompletion(args: {
+  deps: GatewayDeps;
+  request: FastifyRequest;
+  reply: FastifyReply;
+  chatRequest: ChatRequest;
+  requestId: string;
+  schedule: ScheduleAudit;
+  flushAudit: (request: FastifyRequest, statusCode: number) => Promise<void>;
+}): Promise<FastifyReply> {
+  const { deps, request, reply, chatRequest, requestId, schedule, flushAudit } = args;
+
+  const { prompt, reserve } = reservationFor(chatRequest);
+  const gate = await deps.budget.reserve(deps.tenantId, MODEL_CLASS, requestId, reserve);
+
+  if (gate.impossible) {
+    schedule({
+      outcome: 'failed',
+      finalProvider: null,
+      cacheResult: 'bypass',
+      tokenSource: 'estimated',
+      estPromptTokens: reserve,
+    });
+    return reply.code(400).send({
+      error: {
+        message: `this request reserves about ${reserve} tokens, which is more than the budget can ever hold`,
+        type: 'invalid_request_error',
+        code: 'request_exceeds_budget',
+      },
+    });
+  }
+
+  if (!gate.admitted) {
+    schedule({
+      outcome: 'failed',
+      finalProvider: null,
+      cacheResult: 'bypass',
+      tokenSource: 'estimated',
+      estPromptTokens: reserve,
+    });
+    return reply
+      .header('retry-after', String(Math.ceil(gate.retryAfterMs / 1_000)))
+      .code(429)
+      .send({
+        error: {
+          message: 'token budget exhausted for this tenant',
+          type: 'rate_limit_exceeded',
+          code: 'token_budget_exhausted',
+        },
+      });
+  }
+
+  const profile = deps.providers[0];
+  if (profile === undefined) {
+    await deps.budget.settle(deps.tenantId, MODEL_CLASS, requestId, reserve, 0);
+    schedule({
+      outcome: 'failed',
+      finalProvider: null,
+      cacheResult: 'bypass',
+      tokenSource: 'estimated',
+    });
+    return reply.code(502).send({
+      error: { message: 'no providers are configured', type: 'configuration_error' },
+    });
+  }
+
+  const controller = new AbortController();
+  const onClose = (): void => {
+    if (!reply.raw.writableFinished) controller.abort();
+  };
+  reply.raw.on('close', onClose);
+
+  const opened = await deps.client.openStream(profile, chatRequest, {
+    apiKey: deps.apiKeys[profile.name],
+    signal: controller.signal,
+  });
+
+  if (!opened.ok) {
+    // Nothing has been written, so the caller can still be told plainly what
+    // went wrong instead of receiving a 200 that carries an error inside it.
+    reply.raw.off('close', onClose);
+    await deps.budget.settle(deps.tenantId, MODEL_CLASS, requestId, reserve, 0);
+    schedule({
+      outcome: 'failed',
+      finalProvider: opened.provider,
+      cacheResult: 'bypass',
+      tokenSource: 'estimated',
+      estPromptTokens: reserve,
+      attempts: [
+        {
+          attemptNo: 1,
+          provider: opened.provider,
+          outcome: opened.status === 429 ? 'rate_limited' : 'http_error',
+          httpStatus: opened.status,
+          errorCode: opened.code,
+          latencyMs: opened.latencyMs,
+          committed: false,
+          providerRequestId: null,
+        },
+      ],
+    });
+    const status = statusForFailure(opened);
+    if (status === 429 && opened.retryAfterMs !== null) {
+      void reply.header('retry-after', String(Math.ceil(opened.retryAfterMs / 1_000)));
+    }
+    return reply.code(status).send({
+      error: {
+        message: opened.message,
+        type: opened.disposition === 'fatal' ? 'invalid_request_error' : 'upstream_error',
+        code: opened.code,
+      },
+    });
+  }
+
+  // The only bound on how much of a slow client's backlog is held in memory.
+  const passThrough = new PassThrough({ highWaterMark: 64 * 1024 });
+
+  const result = await relayStream({
+    body: opened.body,
+    commitDeadlineMs: deps.commitDeadlineMs,
+    signal: controller.signal,
+    commit: () => {
+      void reply
+        .header('content-type', 'text/event-stream; charset=utf-8')
+        // no-transform is what stops a compression layer collapsing the stream
+        // into one burst, which no assertion on the frames would ever catch.
+        .header('cache-control', 'no-cache, no-transform')
+        .header('connection', 'keep-alive')
+        .header('x-accel-buffering', 'no')
+        .header('x-modelgate-provider', opened.provider)
+        .header('x-modelgate-cache', 'bypass')
+        .code(200)
+        .send(passThrough);
+      return passThrough;
+    },
+  });
+
+  reply.raw.off('close', onClose);
+
+  // A crude live count: one content frame is close to one token, and it costs
+  // nothing to keep. Phase four replaces it with a periodic exact re-encode
+  // reconciled against the provider's own usage frame.
+  const spent = prompt + result.contentFrames;
+  await deps.budget.settle(deps.tenantId, MODEL_CLASS, requestId, reserve, spent);
+
+  schedule({
+    outcome: outcomeForAudit(result),
+    finalProvider: opened.provider,
+    cacheResult: 'bypass',
+    tokenSource: 'estimated',
+    estPromptTokens: reserve,
+    promptTokens: prompt,
+    completionTokens: result.contentFrames,
+    attempts: [
+      {
+        attemptNo: 1,
+        provider: opened.provider,
+        outcome: result.outcome === 'stream_abort' ? 'stream_abort'
+          : result.outcome === 'truncated_clean' ? 'truncated_clean'
+          : result.outcome === 'in_band_error' ? 'http_error'
+          : 'ok',
+        httpStatus: opened.status,
+        errorCode: result.errorMessage === null ? null : 'upstream_stream_error',
+        latencyMs: opened.latencyMs,
+        committed: result.committed,
+        providerRequestId: null,
+      },
+    ],
+  });
+
+  if (!result.committed) {
+    // The stream opened and then died without producing anything. Nothing has
+    // been sent, so this can still be an honest error rather than an empty 200.
+    return reply.code(502).send({
+      error: {
+        message: result.errorMessage ?? 'the provider opened a stream and sent nothing',
+        type: 'upstream_error',
+        code: 'empty_stream',
+      },
+    });
+  }
+
+  // Ending the sink is what told Fastify the response was done, so the
+  // onResponse hook has very likely already run and found nothing pending.
+  await flushAudit(request, reply.statusCode);
+  return reply;
+}
+
 /** Everything the audit row needs, captured before the response is sent. */
 interface PendingAudit {
   record: Omit<AuditRecord, 'redactionClasses' | 'entropySuspect'>;
@@ -130,7 +379,16 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
    * gone out. Neither belongs on the caller's latency, and the hook runs for
    * every reply mode, so a request cannot finish without being recorded.
    */
-  app.addHook('onResponse', async (request, reply) => {
+  /**
+   * Writes whatever is pending for this request, once.
+   *
+   * Called from the onResponse hook and again when a stream finishes, because
+   * the two race. Ending the relay's sink is exactly what makes Fastify
+   * consider the response complete, so for a streaming request the hook fires
+   * before the handler has finished working out what to record. Whichever
+   * arrives second finds the map empty and does nothing.
+   */
+  const flushAudit = async (request: FastifyRequest, statusCode: number): Promise<void> => {
     const entry = pending.get(request);
     if (entry === undefined) return;
     pending.delete(request);
@@ -143,7 +401,7 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
       await deps.audit.write(
         {
           ...entry.record,
-          httpStatus: reply.statusCode,
+          httpStatus: statusCode,
           redactionClasses: [
             ...new Set([...redactedPrompt.classes, ...(redactedCompletion?.classes ?? [])]),
           ],
@@ -164,6 +422,10 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
       // audit trail has to be explainable afterwards.
       request.log.error({ err, requestId: entry.record.requestId }, 'audit write failed');
     }
+  };
+
+  app.addHook('onResponse', async (request, reply) => {
+    await flushAudit(request, reply.statusCode);
   });
 
   app.post('/v1/chat/completions', async (request, reply) => {
@@ -176,18 +438,6 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
         error: {
           message: `${issue?.path.join('.') || 'body'}: ${issue?.message ?? 'invalid request'}`,
           type: 'invalid_request_error',
-        },
-      });
-    }
-
-    // Streaming lands in phase 3. Saying so is better than accepting the flag
-    // and silently returning a non-streamed body, which a caller would only
-    // discover by watching nothing arrive incrementally.
-    if (parsed.data.stream === true) {
-      return reply.code(501).send({
-        error: {
-          message: 'streaming is not implemented yet; omit stream or set it to false',
-          type: 'not_implemented',
         },
       });
     }
@@ -234,6 +484,18 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
         attempts: partial.attempts ?? [],
       });
     };
+
+    if (chatRequest.stream === true) {
+      return streamCompletion({
+        deps,
+        request,
+        reply,
+        chatRequest,
+        requestId,
+        schedule,
+        flushAudit,
+      });
+    }
 
     // Looked up before the budget is touched, because a hit costs nothing
     // upstream and charging a tenant's tokens for work no provider did would be
@@ -377,11 +639,10 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
       });
     }
 
-    // A fatal failure is the caller's problem and keeps the provider's own
-    // status. Anything else means every provider was tried and none could
-    // serve it, which is a gateway-level 502 regardless of what the last one
-    // happened to return.
-    const status = failure.disposition === 'fatal' ? (failure.status ?? 400) : 502;
+    const status = statusForFailure(failure);
+    if (status === 429 && failure.retryAfterMs !== null) {
+      void reply.header('retry-after', String(Math.ceil(failure.retryAfterMs / 1_000)));
+    }
 
     schedule({
       outcome: 'failed',

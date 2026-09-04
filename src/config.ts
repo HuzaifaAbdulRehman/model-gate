@@ -56,6 +56,15 @@ const EnvSchema = z.object({
   REQUEST_DEADLINE_MS: z.coerce.number().int().positive().default(60_000),
 
   /**
+   * How long the gateway holds a stream's headers waiting for real content.
+   *
+   * Before the first byte a failure can still be a clean HTTP error; after it
+   * the status is 200 and every error has to travel in-band. Waiting buys a
+   * better error and costs time to first token, so it stays small.
+   */
+  STREAM_COMMIT_DEADLINE_MS: z.coerce.number().int().positive().default(500),
+
+  /**
    * Exact match only. A prompt that differs by one character is a different
    * question, and deciding when a merely similar prompt is NOT a hit is the
    * interesting half of semantic caching that this does not attempt.

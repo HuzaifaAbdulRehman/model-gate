@@ -79,6 +79,7 @@ export function buildServer({ config, db, cache, client }: ServerDeps): FastifyI
     audit: new AuditWriter(db),
     redactor: new Redactor({ pepper: config.REDACTION_PEPPER }),
     deadlineMs: config.REQUEST_DEADLINE_MS,
+    commitDeadlineMs: config.STREAM_COMMIT_DEADLINE_MS,
     tenantId: DEFAULT_TENANT,
   });
 
