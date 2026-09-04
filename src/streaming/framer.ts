@@ -115,6 +115,8 @@ export interface ChunkView {
   /** True when the frame carried a content delta, which is what commits a stream. */
   hasContent: boolean;
   error: { message?: string } | null;
+  /** The delta's text, so a caller can accumulate without re-parsing. */
+  content: string | null;
   /**
    * Held constant across a response. Captured so a terminal frame the gateway
    * has to invent still belongs to the same stream the client was reading.
@@ -122,6 +124,14 @@ export interface ChunkView {
   id: string | null;
   model: string | null;
   created: number | null;
+  /**
+   * The parsed chunk.
+   *
+   * Handed back so usage extraction stays with the provider profile instead of
+   * being duplicated here. Where a provider puts usage is a provider fact, and
+   * it belongs in exactly one place.
+   */
+  parsed: unknown;
 }
 
 export function viewChunk(frame: SseFrame): ChunkView | null {
@@ -158,9 +168,11 @@ export function viewChunk(frame: SseFrame): ChunkView | null {
           : chunk.x_groq?.error !== undefined
             ? { message: chunk.x_groq.error }
             : null,
+      content: typeof content === 'string' ? content : null,
       id: typeof chunk.id === 'string' ? chunk.id : null,
       model: typeof chunk.model === 'string' ? chunk.model : null,
       created: typeof chunk.created === 'number' ? chunk.created : null,
+      parsed,
     };
   }
 

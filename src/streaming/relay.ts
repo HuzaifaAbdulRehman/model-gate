@@ -1,5 +1,6 @@
 import { once } from 'node:events';
 import type { Writable } from 'node:stream';
+import type { Usage } from '../providers/profile.js';
 import { DONE_SENTINEL, SseFramer, isDone, viewChunk } from './framer.js';
 
 /**
@@ -38,6 +39,21 @@ export interface RelayResult {
   contentFrames: number;
   finishReason: string | null;
   errorMessage: string | null;
+  /** The relayed completion, kept for the audit log. */
+  completionText: string;
+  /**
+   * Best available completion count, and where it came from.
+   *
+   * A provider that sent no usage frame did not report zero, it reported
+   * nothing. Interrupted and cancelled streams are exactly the cases where it
+   * never arrives, so `estimated` is the ordinary value here rather than an
+   * edge case, and the difference has to survive into the audit row.
+   */
+  completionTokens: number;
+  providerUsage: Usage | null;
+  tokenSource: 'provider' | 'estimated';
+  /** True when the gateway stopped the stream for running past its ceiling. */
+  budgetStopped: boolean;
 }
 
 export interface RelayOptions {
@@ -57,6 +73,28 @@ export interface RelayOptions {
    */
   commitDeadlineMs: number;
   signal: AbortSignal;
+  /**
+   * Counts a whole string. Called on the accumulated completion, never on one
+   * delta.
+   *
+   * Counting deltas separately and adding them up over-counts badly, because a
+   * token boundary and a delta boundary are not the same thing: the encoder
+   * cannot merge across a call it never sees. Re-encoding the prefix costs a
+   * couple of milliseconds on a long response and is exact.
+   */
+  countTokens?: (text: string) => number;
+  /** Where this provider puts usage. Never assume the top level. */
+  extractUsage?: (chunk: unknown) => Usage | null;
+  /**
+   * Stop the stream if the completion passes this.
+   *
+   * The reason the cheap running count exists at all: without it a model that
+   * ignores max_tokens bills a tenant for a generation nobody bounded.
+   */
+  maxCompletionTokens?: number;
+  /** Recount cadence. Whichever comes first. */
+  recountEveryDeltas?: number;
+  recountEveryMs?: number;
 }
 
 const TRUNCATING_REASONS = new Set(['length', 'content_filter']);
@@ -78,6 +116,24 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
   let sawDone = false;
   let clientGone = false;
   let transportFailed = false;
+
+  const count = options.countTokens ?? ((text: string) => text.length);
+  const recountEveryDeltas = options.recountEveryDeltas ?? 64;
+  const recountEveryMs = options.recountEveryMs ?? 250;
+  /** Kept as pieces and joined on demand, so the common path does no copying. */
+  const completionChunks: string[] = [];
+  let completionTokens = 0;
+  let providerUsage: Usage | null = null;
+  let budgetStopped = false;
+  let deltasSinceRecount = 0;
+  let lastRecountAt = Date.now();
+  let stopping = false;
+
+  const recount = (): void => {
+    completionTokens = count(completionChunks.join(''));
+    deltasSinceRecount = 0;
+    lastRecountAt = Date.now();
+  };
   const identity: { id: string | null; model: string | null; created: number | null } = {
     id: null,
     model: null,
@@ -122,6 +178,7 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
         clientGone = true;
         break;
       }
+      if (stopping) break;
 
       for (const frame of framer.push(chunk)) {
         if (isDone(frame)) {
@@ -140,7 +197,41 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
           errorMessage = view.error.message ?? 'provider reported an error mid-stream';
         }
         if (view?.finishReason != null) finishReason = view.finishReason;
-        if (view?.hasContent === true) contentFrames += 1;
+
+        // Read on every frame, never only the last one. Providers disagree
+        // about where the usage chunk sits, and at least one puts it
+        // second to last, so a last-frame-only reader silently records zero.
+        const usage = options.extractUsage?.(view?.parsed);
+        if (usage != null) providerUsage = usage;
+
+        if (view?.hasContent === true && view.content !== null) {
+          contentFrames += 1;
+          completionChunks.push(view.content);
+          deltasSinceRecount += 1;
+
+          // Counter two. Exact, because it re-encodes the whole prefix, and
+          // affordable because it runs on a cadence rather than per delta.
+          if (
+            deltasSinceRecount >= recountEveryDeltas ||
+            Date.now() - lastRecountAt >= recountEveryMs
+          ) {
+            recount();
+          }
+
+          // Counter one: the cheap running length, checked every delta. This is
+          // the only thing standing between a model that ignores max_tokens and
+          // a tenant billed for an unbounded generation.
+          if (
+            options.maxCompletionTokens !== undefined &&
+            Math.max(completionTokens, deltasSinceRecount) > options.maxCompletionTokens
+          ) {
+            recount();
+            if (completionTokens > options.maxCompletionTokens) {
+              budgetStopped = true;
+              stopping = true;
+            }
+          }
+        }
 
         if (out.sink === null) {
           pending.push(frame.raw);
@@ -150,12 +241,21 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
         } else {
           await write(frame.raw);
         }
+
+        if (stopping) break;
       }
     }
 
     // Whatever the provider managed to say before the socket went is still
     // worth forwarding, and it is often the most informative frame.
-    const tail = framer.flush();
+    //
+    // Only when the stream ended on its own, though. Breaking out of the read
+    // loop leaves every frame the current chunk still held sitting in the
+    // framer, and flushing that would hand the client the whole rest of a
+    // response the gateway had just decided to stop, uncounted. It shows up
+    // only when a provider's frames arrive in one packet, which is why the
+    // frame-at-a-time case looks perfectly healthy.
+    const tail = stopping || clientGone ? null : framer.flush();
     if (tail !== null) {
       const view = viewChunk(tail);
       if (view?.finishReason != null) finishReason = view.finishReason;
@@ -192,11 +292,17 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
     // so inside itself. Ending quietly instead would hand the caller a truncated
     // answer that looks complete, which is the failure this whole distinction
     // exists to prevent.
-    if (outcome === 'stream_abort' || outcome === 'in_band_error') {
-      const message = errorMessage ?? 'the provider stopped responding mid-stream';
+    if (outcome === 'stream_abort' || outcome === 'in_band_error' || budgetStopped) {
+      const message = budgetStopped
+        ? 'stopped by the gateway: the completion passed the token ceiling for this request'
+        : (errorMessage ?? 'the provider stopped responding mid-stream');
       await write(
         `event: error\ndata: ${JSON.stringify({
-          error: { message, type: 'upstream_error', code: 'modelgate_interrupted' },
+          error: {
+            message,
+            type: budgetStopped ? 'rate_limit_exceeded' : 'upstream_error',
+            code: budgetStopped ? 'modelgate_budget_exceeded' : 'modelgate_interrupted',
+          },
         })}\n\n`,
       );
       await write(
@@ -205,7 +311,16 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
           object: 'chat.completion.chunk',
           created: identity.created ?? Math.floor(Date.now() / 1000),
           model: identity.model ?? 'unknown',
-          choices: [{ index: 0, delta: {}, finish_reason: 'modelgate_interrupted' }],
+          choices: [
+            {
+              index: 0,
+              delta: {},
+              // `length` because that is what a caller's client already knows
+              // how to read: the answer stopped at a ceiling. The error frame
+              // above says whose ceiling it was.
+              finish_reason: budgetStopped ? 'length' : 'modelgate_interrupted',
+            },
+          ],
         })}\n\n`,
       );
     }
@@ -214,6 +329,11 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
     committedSink.end();
   }
 
+  // Counter three, and the last word when it exists. Before it, one final exact
+  // pass so the recorded number is never a stale sample from the previous
+  // cadence tick.
+  recount();
+
   return {
     outcome,
     committed: committedSink !== null,
@@ -221,6 +341,11 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
     contentFrames,
     finishReason,
     errorMessage,
+    completionText: completionChunks.join(''),
+    completionTokens: providerUsage?.completion_tokens ?? completionTokens,
+    providerUsage,
+    tokenSource: providerUsage !== null ? 'provider' : 'estimated',
+    budgetStopped,
   };
 }
 
