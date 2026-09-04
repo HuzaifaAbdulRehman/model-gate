@@ -9,7 +9,7 @@ import type { CompletionCache } from '../cache/completions.js';
 import type { TokenBudget } from '../limits/budget.js';
 import type { ProviderClient } from '../providers/client.js';
 import type { ChatRequest, ProviderProfile } from '../providers/profile.js';
-import { countTokens, reservationFor } from '../tokens/counter.js';
+import { DEFAULT_MAX_TOKENS, countTokens, reservationFor } from '../tokens/counter.js';
 import { apiKeyMatches, bearerToken } from './auth.js';
 import type { Disposition } from '../providers/errors.js';
 import { dispatch, type AttemptRecord, type DispatchResult } from './dispatch.js';
@@ -135,6 +135,23 @@ function statusForFailure(failure: { disposition: Disposition; status: number | 
   if (failure.disposition === 'fatal') return failure.status ?? 400;
   if (failure.status === 429) return 429;
   return 502;
+}
+
+/**
+ * Where the recorded token count came from.
+ *
+ * `partial_estimated` is not a rare case: an interrupted or cancelled stream is
+ * precisely when the provider's usage frame never arrives, and that is the same
+ * moment the gateway most needs a number. Recording it as though the provider
+ * had said so is how accounting drifts without anyone noticing.
+ */
+function tokenSourceForAudit(result: RelayResult): AuditRecord['tokenSource'] {
+  if (result.tokenSource === 'provider') return 'provider';
+  const interrupted =
+    result.outcome === 'stream_abort' ||
+    result.outcome === 'in_band_error' ||
+    result.outcome === 'client_gone';
+  return interrupted ? 'partial_estimated' : 'estimated';
 }
 
 /** How a stream ended, in the vocabulary the audit table uses. */
@@ -282,6 +299,14 @@ async function streamCompletion(args: {
     body: opened.body,
     commitDeadlineMs: deps.commitDeadlineMs,
     signal: controller.signal,
+    countTokens: (text) => countTokens(text),
+    // Asked of the profile, because where a provider puts usage is a provider
+    // fact and belongs in exactly one place.
+    extractUsage: (chunk) => profile.extractUsage(chunk),
+    // A request that named no ceiling still gets one. The budget already
+    // reserved this much, and a model that ignores max_tokens would otherwise
+    // bill a tenant for a generation nobody bounded.
+    maxCompletionTokens: chatRequest.max_tokens ?? DEFAULT_MAX_TOKENS,
     commit: () => {
       void reply
         .header('content-type', 'text/event-stream; charset=utf-8')
@@ -300,20 +325,19 @@ async function streamCompletion(args: {
 
   reply.raw.off('close', onClose);
 
-  // A crude live count: one content frame is close to one token, and it costs
-  // nothing to keep. Phase four replaces it with a periodic exact re-encode
-  // reconciled against the provider's own usage frame.
-  const spent = prompt + result.contentFrames;
+  const promptTokens = result.providerUsage?.prompt_tokens ?? prompt;
+  const spent = result.providerUsage?.total_tokens ?? promptTokens + result.completionTokens;
   await deps.budget.settle(deps.tenantId, MODEL_CLASS, requestId, reserve, spent);
 
   schedule({
     outcome: outcomeForAudit(result),
     finalProvider: opened.provider,
     cacheResult: 'bypass',
-    tokenSource: 'estimated',
+    tokenSource: tokenSourceForAudit(result),
     estPromptTokens: reserve,
-    promptTokens: prompt,
-    completionTokens: result.contentFrames,
+    promptTokens,
+    completionTokens: result.completionTokens,
+    rawCompletion: result.completionText,
     attempts: [
       {
         attemptNo: 1,
