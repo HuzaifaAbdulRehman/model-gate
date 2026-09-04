@@ -167,12 +167,17 @@ describe('proxying', () => {
     expect(open.primary.count()).toBe(0);
   });
 
-  it('says streaming is not implemented rather than silently not streaming', async () => {
+  it('answers a streaming request as SSE', async () => {
+    // A smoke test at this layer. The framing, the commit point and the
+    // terminal handling all live in the streaming suite, which uses a real
+    // socket rather than an injected request.
     open = await harness();
     const res = await chat(open.app, { stream: true });
 
-    expect(res.statusCode).toBe(501);
-    expect(open.primary.count()).toBe(0);
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toBe('text/event-stream; charset=utf-8');
+    expect(res.body).toContain('data: [DONE]');
+    expect(open.primary.count()).toBe(1);
   });
 });
 
@@ -230,11 +235,16 @@ describe('failover', () => {
     expect(body.error.message).toMatch(/unsupported value for parameter model/);
   });
 
-  it('returns 502 once every provider has failed', async () => {
+  it('passes a rate limit through rather than calling it a gateway fault', async () => {
+    // 502 and 429 ask the caller for different things. 502 says the upstream is
+    // broken and invites an alert; 429 with a retry-after says the quota is
+    // spent and says when to come back. Reporting a saturated provider as a
+    // fault sends someone debugging a healthy service.
     open = await harness({ primaryFails: '429', backupFails: '429' });
     const res = await chat(open.app);
 
-    expect(res.statusCode).toBe(502);
+    expect(res.statusCode).toBe(429);
+    expect(res.headers['retry-after']).toBeDefined();
     const body = res.json() as { error: { type: string } };
     expect(body.error.type).toBe('upstream_error');
     expect(open.primary.count()).toBe(1);
@@ -332,10 +342,10 @@ describe('caching', () => {
 
   it('does not store a failed response', async () => {
     open = await harness({ primaryFails: '429', backupFails: '429' });
-    expect((await chat(open.app)).statusCode).toBe(502);
+    expect((await chat(open.app)).statusCode).toBe(429);
     const retry = await chat(open.app);
 
-    expect(retry.statusCode).toBe(502);
+    expect(retry.statusCode).toBe(429);
     expect(retry.headers['x-modelgate-cache']).toBeUndefined();
   });
 
@@ -402,7 +412,7 @@ describe('token budget', () => {
     open = await harness({ primaryFails: '429', backupFails: '429' });
     const res = await chat(open.app);
 
-    expect(res.statusCode).toBe(502);
+    expect(res.statusCode).toBe(429);
     expect(Number(res.headers['x-modelgate-tokens-remaining'])).toBe(100_000);
   });
 });
