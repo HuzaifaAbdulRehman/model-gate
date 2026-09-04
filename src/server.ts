@@ -1,4 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify';
+import { Redactor } from './audit/redact.js';
+import { AuditWriter } from './audit/writer.js';
 import { CompletionCache } from './cache/completions.js';
 import type { Config } from './config.js';
 import type { Db } from './db.js';
@@ -74,6 +76,8 @@ export function buildServer({ config, db, cache, client }: ServerDeps): FastifyI
       enabled: config.CACHE_ENABLED,
       ttlSeconds: config.CACHE_TTL_SECONDS,
     }),
+    audit: new AuditWriter(db),
+    redactor: new Redactor({ pepper: config.REDACTION_PEPPER }),
     deadlineMs: config.REQUEST_DEADLINE_MS,
     tenantId: DEFAULT_TENANT,
   });

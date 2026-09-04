@@ -21,6 +21,14 @@ const EnvSchema = z.object({
   GATEWAY_API_KEY: z.string().min(16),
 
   /**
+   * Keys the HMAC ids in redacted audit rows. Must live outside the database,
+   * so a dump on its own cannot re-identify what was removed: emails and phone
+   * numbers come from a small enough space that an unkeyed digest is reversible
+   * by enumeration.
+   */
+  REDACTION_PEPPER: z.string().min(32),
+
+  /**
    * Tried in order. The first that answers wins, so this is the failover chain
    * rather than a set.
    */

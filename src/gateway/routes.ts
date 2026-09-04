@@ -1,13 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
+import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
+import { ENGINE_VERSION, type Redactor } from '../audit/redact.js';
+import type { AuditRecord, AuditWriter } from '../audit/writer.js';
 import type { CompletionCache } from '../cache/completions.js';
 import type { TokenBudget } from '../limits/budget.js';
 import type { ProviderClient } from '../providers/client.js';
 import type { ChatRequest, ProviderProfile } from '../providers/profile.js';
 import { countTokens, reservationFor } from '../tokens/counter.js';
 import { apiKeyMatches, bearerToken } from './auth.js';
-import { dispatch, type DispatchResult } from './dispatch.js';
+import { dispatch, type AttemptRecord, type DispatchResult } from './dispatch.js';
 import type { BackoffOptions } from './backoff.js';
 
 /**
@@ -46,6 +48,8 @@ export interface GatewayDeps {
   backoff: BackoffOptions;
   budget: TokenBudget;
   cache: CompletionCache;
+  audit: AuditWriter;
+  redactor: Redactor;
   deadlineMs: number;
   /**
    * A single static key means a single tenant. Mapping keys to tenants is the
@@ -65,31 +69,53 @@ export interface GatewayDeps {
 function actualUsage(
   result: DispatchResult,
   estimatedPrompt: number,
-): { tokens: number; source: 'provider' | 'estimated' } {
+): { tokens: number; completion: number; source: 'provider' | 'estimated' } {
   const usage = result.success?.usage;
+  const text = completionText(result);
+
   if (usage?.total_tokens !== undefined) {
-    return { tokens: usage.total_tokens, source: 'provider' };
+    return {
+      tokens: usage.total_tokens,
+      completion: usage.completion_tokens ?? countTokens(text),
+      source: 'provider',
+    };
   }
 
   if (result.success !== null) {
-    const choices = result.success.body['choices'];
-    const content = Array.isArray(choices)
-      ? (choices[0] as { message?: { content?: unknown } } | undefined)?.message?.content
-      : undefined;
-    const completion = typeof content === 'string' ? countTokens(content) : 0;
-    return { tokens: estimatedPrompt + completion, source: 'estimated' };
+    const completion = countTokens(text);
+    return { tokens: estimatedPrompt + completion, completion, source: 'estimated' };
   }
 
   // Nothing was served. Failed attempts did cost the provider something, but no
   // number for it exists anywhere, so the reservation is returned in full. That
   // errs in the tenant's favour, which is the safer direction to be wrong in.
-  return { tokens: 0, source: 'estimated' };
+  return { tokens: 0, completion: 0, source: 'estimated' };
+}
+
+function completionText(result: DispatchResult): string {
+  const choices = result.success?.body['choices'];
+  const content = Array.isArray(choices)
+    ? (choices[0] as { message?: { content?: unknown } } | undefined)?.message?.content
+    : undefined;
+  return typeof content === 'string' ? content : '';
+}
+
+/** Everything the audit row needs, captured before the response is sent. */
+interface PendingAudit {
+  record: Omit<AuditRecord, 'redactionClasses' | 'entropySuspect'>;
+  rawPrompt: string;
+  rawCompletion: string | null;
+  attempts: readonly AttemptRecord[];
 }
 
 export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
   app: FastifyInstance,
   deps: GatewayDeps,
 ) => {
+  // Keyed by request rather than decorated onto it, so nothing is shared
+  // between requests by accident and the entry disappears with the request.
+  const pending = new WeakMap<FastifyRequest, PendingAudit>();
+
   app.addHook('onRequest', async (request, reply) => {
     const token = bearerToken(request.headers.authorization);
     if (token === null || !apiKeyMatches(token, deps.apiKey)) {
@@ -99,7 +125,50 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
     }
   });
 
+  /**
+   * Redaction and the database write both happen here, after the response has
+   * gone out. Neither belongs on the caller's latency, and the hook runs for
+   * every reply mode, so a request cannot finish without being recorded.
+   */
+  app.addHook('onResponse', async (request, reply) => {
+    const entry = pending.get(request);
+    if (entry === undefined) return;
+    pending.delete(request);
+
+    try {
+      const redactedPrompt = deps.redactor.redact(entry.rawPrompt);
+      const redactedCompletion =
+        entry.rawCompletion === null ? null : deps.redactor.redact(entry.rawCompletion);
+
+      await deps.audit.write(
+        {
+          ...entry.record,
+          httpStatus: reply.statusCode,
+          redactionClasses: [
+            ...new Set([...redactedPrompt.classes, ...(redactedCompletion?.classes ?? [])]),
+          ],
+          entropySuspect: redactedPrompt.entropySuspect || (redactedCompletion?.entropySuspect ?? false),
+        },
+        {
+          prompt: redactedPrompt.text,
+          completion: redactedCompletion?.text ?? null,
+          promptFingerprint: deps.redactor.fingerprint(entry.rawPrompt),
+          redactions: [...redactedPrompt.entries, ...(redactedCompletion?.entries ?? [])],
+          engineVersion: ENGINE_VERSION,
+        },
+        entry.attempts,
+      );
+    } catch (err) {
+      // The response has already been sent, so there is nobody left to tell.
+      // Logged with the request id rather than swallowed, because a gap in the
+      // audit trail has to be explainable afterwards.
+      request.log.error({ err, requestId: entry.record.requestId }, 'audit write failed');
+    }
+  });
+
   app.post('/v1/chat/completions', async (request, reply) => {
+    const startedAt = Date.now();
+
     const parsed = ChatRequestSchema.safeParse(request.body);
     if (!parsed.success) {
       const issue = parsed.error.issues[0];
@@ -124,6 +193,47 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
     }
 
     const chatRequest = parsed.data as ChatRequest;
+    const requestId = randomUUID();
+    // The messages as sent, so a secret in any field is seen by the redactor
+    // rather than only the ones a schema happened to name.
+    const rawPrompt = JSON.stringify(chatRequest.messages);
+    const idempotencyKey = headerValue(request.headers['idempotency-key']);
+
+    const schedule = (
+      partial: Pick<
+        AuditRecord,
+        'outcome' | 'finalProvider' | 'cacheResult' | 'tokenSource'
+      > & {
+        estPromptTokens?: number | null;
+        promptTokens?: number | null;
+        completionTokens?: number | null;
+        rawCompletion?: string | null;
+        attempts?: readonly AttemptRecord[];
+      },
+    ): void => {
+      pending.set(request, {
+        record: {
+          requestId,
+          tenantId: deps.tenantId,
+          idempotencyKey,
+          model: chatRequest.model,
+          stream: false,
+          outcome: partial.outcome,
+          httpStatus: null,
+          finalProvider: partial.finalProvider,
+          cacheResult: partial.cacheResult,
+          estPromptTokens: partial.estPromptTokens ?? null,
+          promptTokens: partial.promptTokens ?? null,
+          completionTokens: partial.completionTokens ?? null,
+          tokenSource: partial.tokenSource,
+          ttfbMs: null,
+          totalMs: Date.now() - startedAt,
+        },
+        rawPrompt,
+        rawCompletion: partial.rawCompletion ?? null,
+        attempts: partial.attempts ?? [],
+      });
+    };
 
     // Looked up before the budget is touched, because a hit costs nothing
     // upstream and charging a tenant's tokens for work no provider did would be
@@ -131,6 +241,13 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
     const cacheKey = deps.cache.key(chatRequest, deps.tenantId);
     const cached = await deps.cache.get(cacheKey);
     if (cached.body !== null) {
+      schedule({
+        outcome: 'ok',
+        finalProvider: null,
+        cacheResult: 'hit',
+        tokenSource: 'estimated',
+        rawCompletion: completionText({ success: { body: cached.body } } as DispatchResult),
+      });
       return reply
         .header('x-modelgate-cache', 'hit')
         .header('x-modelgate-attempts', '0')
@@ -138,10 +255,9 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
         .send(cached.body);
     }
 
-    const requestId = randomUUID();
     const { prompt, reserve } = reservationFor(chatRequest);
 
-    // The real cost is unknown until the response ends, so the worst case is
+    // The true cost is unknown until the response ends, so the worst case is
     // held first and the difference given back afterwards. Checking afterwards
     // instead would admit every concurrent request on the same stale reading.
     const gate = await deps.budget.reserve(deps.tenantId, MODEL_CLASS, requestId, reserve);
@@ -150,6 +266,13 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
       // A different answer from "not right now". No amount of waiting makes a
       // request larger than the whole bucket fit, so a 429 would be telling the
       // caller to retry something that can never succeed.
+      schedule({
+        outcome: 'failed',
+        finalProvider: null,
+        cacheResult: 'miss',
+        tokenSource: 'estimated',
+        estPromptTokens: reserve,
+      });
       return reply.code(400).send({
         error: {
           message: `this request reserves about ${reserve} tokens, which is more than the budget can ever hold`,
@@ -160,6 +283,13 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
     }
 
     if (!gate.admitted) {
+      schedule({
+        outcome: 'failed',
+        finalProvider: null,
+        cacheResult: 'miss',
+        tokenSource: 'estimated',
+        estPromptTokens: reserve,
+      });
       return reply
         .header('retry-after', String(Math.ceil(gate.retryAfterMs / 1_000)))
         .header('x-modelgate-tokens-remaining', String(gate.remaining))
@@ -185,7 +315,7 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
 
     let result: DispatchResult | null = null;
     let remaining = gate.remaining;
-    let tokenSource: 'provider' | 'estimated' = 'estimated';
+    let used = { tokens: 0, completion: 0, source: 'estimated' as 'provider' | 'estimated' };
     try {
       result = await dispatch(chatRequest, {
         providers: deps.providers,
@@ -200,8 +330,7 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
       reply.raw.off('close', onClose);
       // In a finally so an unexpected throw still returns the reservation
       // rather than leaving it for the sweep to reclaim a lease TTL later.
-      const used = result === null ? { tokens: 0, source: 'estimated' as const } : actualUsage(result, prompt);
-      tokenSource = used.source;
+      used = result === null ? used : actualUsage(result, prompt);
       remaining = (
         await deps.budget.settle(deps.tenantId, MODEL_CLASS, requestId, reserve, used.tokens)
       ).remaining;
@@ -211,10 +340,21 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
     // failover is visible without reading the audit table.
     void reply.header('x-modelgate-attempts', String(result.attempts.length));
     void reply.header('x-modelgate-tokens-remaining', String(remaining));
-    void reply.header('x-modelgate-token-source', tokenSource);
+    void reply.header('x-modelgate-token-source', used.source);
 
     if (result.success !== null) {
       await deps.cache.set(cacheKey, result.success.body);
+      schedule({
+        outcome: 'ok',
+        finalProvider: result.success.provider,
+        cacheResult: 'miss',
+        tokenSource: used.source,
+        estPromptTokens: reserve,
+        promptTokens: result.success.usage?.prompt_tokens ?? prompt,
+        completionTokens: used.completion,
+        rawCompletion: completionText(result),
+        attempts: result.attempts,
+      });
       return reply
         .header('x-modelgate-provider', result.success.provider)
         .header('x-modelgate-cache', 'miss')
@@ -224,6 +364,14 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
 
     const failure = result.failure;
     if (failure === null) {
+      schedule({
+        outcome: 'failed',
+        finalProvider: null,
+        cacheResult: 'miss',
+        tokenSource: 'estimated',
+        estPromptTokens: reserve,
+        attempts: result.attempts,
+      });
       return reply.code(502).send({
         error: { message: 'no providers are configured', type: 'configuration_error' },
       });
@@ -234,6 +382,15 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
     // serve it, which is a gateway-level 502 regardless of what the last one
     // happened to return.
     const status = failure.disposition === 'fatal' ? (failure.status ?? 400) : 502;
+
+    schedule({
+      outcome: 'failed',
+      finalProvider: failure.provider,
+      cacheResult: 'miss',
+      tokenSource: 'estimated',
+      estPromptTokens: reserve,
+      attempts: result.attempts,
+    });
 
     return reply
       .header('x-modelgate-provider', failure.provider)
@@ -247,3 +404,8 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
       });
   });
 };
+
+function headerValue(value: string | string[] | undefined): string | null {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : null;
+}
