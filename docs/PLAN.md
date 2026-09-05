@@ -191,6 +191,24 @@ cannot be validated. The mock tests prove clean pre-commit failover and honest
 post-commit termination; they do not claim that one model can resume another
 model's sampling state.
 
+## Measured in phase 6: local overhead is visible
+
+`npm run bench` now builds an isolated local stack and prints the environment,
+sample counts and raw measurements as JSON. On 5 September 2026, 200 paired
+requests measured 11.62 ms p99 added latency and 5.46 ms p99 cache-hit latency.
+Across 100 streaming samples, pre-commit failover reached its first token in
+12.72 ms at p99. No failover output differed from the healthy backup, and none
+of 50 interrupted streams ended silently.
+
+These are loopback mock measurements on one laptop. They measure gateway code,
+local Redis and local PostgreSQL; they say nothing about model generation or
+internet latency. Live Groq token calibration remains undone and is named as
+such in the README.
+
+`npm run demo` uses the same isolated approach for a shorter visible check. It
+shows one clean pre-commit failover and one explicit post-commit interruption,
+then exits non-zero if either guarantee breaks.
+
 ## Carried forward from the phase 3 review
 
 **Backpressure is implemented but not directly tested.** The relay waits on

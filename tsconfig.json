@@ -13,5 +13,5 @@
     "resolveJsonModule": true,
     "noEmit": true
   },
-  "include": ["src", "test", "migrations"]
+  "include": ["src", "test", "migrations", "scripts"]
 }

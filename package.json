@@ -13,6 +13,8 @@
     "start": "node --env-file=.env dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
+    "demo": "node --env-file=.env --import tsx scripts/demo.ts",
+    "bench": "node --env-file=.env --import tsx scripts/bench.ts",
     "typecheck": "tsc --noEmit",
     "migrate:up": "node --env-file=.env node_modules/node-pg-migrate/bin/node-pg-migrate.js up",
     "migrate:down": "node --env-file=.env node_modules/node-pg-migrate/bin/node-pg-migrate.js down"
