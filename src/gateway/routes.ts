@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { PassThrough } from 'node:stream';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { FastifyInstance, FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { relayStream, type RelayResult } from '../streaming/relay.js';
@@ -7,13 +8,13 @@ import { ENGINE_VERSION, type Redactor } from '../audit/redact.js';
 import type { AuditRecord, AuditWriter } from '../audit/writer.js';
 import type { CompletionCache } from '../cache/completions.js';
 import type { TokenBudget } from '../limits/budget.js';
-import type { ProviderClient } from '../providers/client.js';
+import type { AttemptError, ProviderClient, StreamOpen } from '../providers/client.js';
 import type { ChatRequest, ProviderProfile } from '../providers/profile.js';
 import { DEFAULT_MAX_TOKENS, countTokens, reservationFor } from '../tokens/counter.js';
 import { apiKeyMatches, bearerToken } from './auth.js';
 import type { Disposition } from '../providers/errors.js';
 import { dispatch, type AttemptRecord, type DispatchResult } from './dispatch.js';
-import type { BackoffOptions } from './backoff.js';
+import { retryDelay, type BackoffOptions } from './backoff.js';
 
 /**
  * One bucket per tenant rather than one per model.
@@ -137,6 +138,73 @@ function statusForFailure(failure: { disposition: Disposition; status: number | 
   return 502;
 }
 
+const TIMEOUT_CODES = new Set([
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'ETIMEDOUT',
+]);
+
+function attemptForOpenFailure(failure: AttemptError, attemptNo: number): AttemptRecord {
+  return {
+    attemptNo,
+    provider: failure.provider,
+    outcome: failure.status === 429
+      ? 'rate_limited'
+      : TIMEOUT_CODES.has(failure.code)
+        ? 'timeout'
+        : 'http_error',
+    httpStatus: failure.status,
+    errorCode: failure.code,
+    latencyMs: failure.latencyMs,
+    committed: false,
+    providerRequestId: null,
+  };
+}
+
+function attemptForStream(
+  opened: StreamOpen,
+  result: RelayResult,
+  attemptNo: number,
+): AttemptRecord {
+  const outcome: AttemptRecord['outcome'] =
+    result.outcome === 'truncated_clean'
+      ? 'truncated_clean'
+      : result.outcome === 'stream_abort' || result.outcome === 'client_gone'
+        ? 'stream_abort'
+        : result.outcome === 'in_band_error'
+          ? 'http_error'
+          : 'ok';
+
+  return {
+    attemptNo,
+    provider: opened.provider,
+    outcome,
+    httpStatus: opened.status,
+    errorCode: result.budgetStopped
+      ? 'modelgate_budget_exceeded'
+      : result.errorMessage === null
+        ? null
+        : 'upstream_stream_error',
+    latencyMs: opened.latencyMs,
+    committed: result.committed,
+    providerRequestId: null,
+  };
+}
+
+function failureFromStream(opened: StreamOpen, result: RelayResult): AttemptError {
+  return {
+    ok: false,
+    provider: opened.provider,
+    disposition: 'retry',
+    status: null,
+    code: result.outcome === 'in_band_error' ? 'upstream_stream_error' : 'empty_stream',
+    message: result.errorMessage ?? 'the provider opened a stream and sent nothing',
+    retryAfterMs: null,
+    latencyMs: opened.latencyMs,
+  };
+}
+
 /**
  * Where the recorded token count came from.
  *
@@ -230,8 +298,7 @@ async function streamCompletion(args: {
       });
   }
 
-  const profile = deps.providers[0];
-  if (profile === undefined) {
+  if (deps.providers.length === 0) {
     await deps.budget.settle(deps.tenantId, MODEL_CLASS, requestId, reserve, 0);
     schedule({
       outcome: 'failed',
@@ -250,80 +317,133 @@ async function streamCompletion(args: {
   };
   reply.raw.on('close', onClose);
 
-  const opened = await deps.client.openStream(profile, chatRequest, {
-    apiKey: deps.apiKeys[profile.name],
-    signal: controller.signal,
-  });
+  // The only bound on how much of a slow client's backlog is held in memory.
+  const passThrough = new PassThrough({ highWaterMark: 64 * 1024 });
+  const attempts: AttemptRecord[] = [];
+  const chainStartedAt = Date.now();
+  let attemptNo = 0;
+  let lastFailure: AttemptError | null = null;
+  let finalOpened: StreamOpen | null = null;
+  let finalResult: RelayResult | null = null;
 
-  if (!opened.ok) {
-    // Nothing has been written, so the caller can still be told plainly what
-    // went wrong instead of receiving a 200 that carries an error inside it.
-    reply.raw.off('close', onClose);
+  providerChain:
+  for (const profile of deps.providers) {
+    for (let tries = 0; tries < deps.maxAttemptsPerProvider; tries += 1) {
+      if (Date.now() - chainStartedAt >= deps.deadlineMs || controller.signal.aborted) {
+        break providerChain;
+      }
+      attemptNo += 1;
+
+      const opened = await deps.client.openStream(profile, chatRequest, {
+        apiKey: deps.apiKeys[profile.name],
+        signal: controller.signal,
+      });
+
+      if (!opened.ok) {
+        lastFailure = opened;
+        attempts.push(attemptForOpenFailure(opened, attemptNo));
+
+        if (opened.disposition === 'fatal') break providerChain;
+        if (opened.disposition === 'failover') break;
+
+        const isLastTry = tries === deps.maxAttemptsPerProvider - 1;
+        if (isLastTry) break;
+        await delay(retryDelay(tries, opened.retryAfterMs, deps.backoff));
+        continue;
+      }
+
+      const result = await relayStream({
+        body: opened.body,
+        commitDeadlineMs: deps.commitDeadlineMs,
+        signal: controller.signal,
+        countTokens: (text) => countTokens(text),
+        // Asked of the profile, because where a provider puts usage is a
+        // provider fact and belongs in exactly one place.
+        extractUsage: (chunk) => profile.extractUsage(chunk),
+        // A request that named no ceiling still gets one. The budget already
+        // reserved this much, and a model that ignores max_tokens would
+        // otherwise bill a tenant for a generation nobody bounded.
+        maxCompletionTokens: chatRequest.max_tokens ?? DEFAULT_MAX_TOKENS,
+        commit: () => {
+          void reply
+            .header('content-type', 'text/event-stream; charset=utf-8')
+            // no-transform is what stops a compression layer collapsing the
+            // stream into one burst, which no assertion on the frames would
+            // ever catch.
+            .header('cache-control', 'no-cache, no-transform')
+            .header('connection', 'keep-alive')
+            .header('x-accel-buffering', 'no')
+            .header('x-modelgate-provider', opened.provider)
+            .header('x-modelgate-cache', 'bypass')
+            .code(200)
+            .send(passThrough);
+          return passThrough;
+        },
+      });
+
+      attempts.push(attemptForStream(opened, result, attemptNo));
+
+      // Once committed, replaying the request would duplicate text the caller
+      // has already displayed. The relay closes that stream with an explicit
+      // error frame instead. A caller abort is final for the same reason: there
+      // is nobody left to receive a retry.
+      if (result.committed || result.outcome === 'client_gone') {
+        finalOpened = opened;
+        finalResult = result;
+        break providerChain;
+      }
+
+      // Headers alone do not commit the response. If the provider dies before
+      // a content delta, its buffered role/error frames are discarded and the
+      // next attempt can still return one clean stream with no seam.
+      lastFailure = failureFromStream(opened, result);
+      const isLastTry = tries === deps.maxAttemptsPerProvider - 1;
+      if (isLastTry) break;
+      await delay(retryDelay(tries, null, deps.backoff));
+    }
+  }
+
+  reply.raw.off('close', onClose);
+
+  if (finalOpened === null || finalResult === null) {
     await deps.budget.settle(deps.tenantId, MODEL_CLASS, requestId, reserve, 0);
+
+    const failure = lastFailure ?? {
+      ok: false as const,
+      provider: 'modelgate',
+      disposition: 'failover' as const,
+      status: null,
+      code: 'gateway_deadline_exceeded',
+      message: `the provider chain did not answer within the deadline (${Date.now() - chainStartedAt}ms)`,
+      retryAfterMs: null,
+      latencyMs: Date.now() - chainStartedAt,
+    };
     schedule({
-      outcome: 'failed',
-      finalProvider: opened.provider,
+      outcome: controller.signal.aborted ? 'client_abort' : 'failed',
+      finalProvider: failure.provider === 'modelgate' ? null : failure.provider,
       cacheResult: 'bypass',
       tokenSource: 'estimated',
       estPromptTokens: reserve,
-      attempts: [
-        {
-          attemptNo: 1,
-          provider: opened.provider,
-          outcome: opened.status === 429 ? 'rate_limited' : 'http_error',
-          httpStatus: opened.status,
-          errorCode: opened.code,
-          latencyMs: opened.latencyMs,
-          committed: false,
-          providerRequestId: null,
-        },
-      ],
+      attempts,
     });
-    const status = statusForFailure(opened);
-    if (status === 429 && opened.retryAfterMs !== null) {
-      void reply.header('retry-after', String(Math.ceil(opened.retryAfterMs / 1_000)));
+
+    if (controller.signal.aborted) return reply;
+
+    const status = statusForFailure(failure);
+    if (status === 429 && failure.retryAfterMs !== null) {
+      void reply.header('retry-after', String(Math.ceil(failure.retryAfterMs / 1_000)));
     }
     return reply.code(status).send({
       error: {
-        message: opened.message,
-        type: opened.disposition === 'fatal' ? 'invalid_request_error' : 'upstream_error',
-        code: opened.code,
+        message: failure.message,
+        type: failure.disposition === 'fatal' ? 'invalid_request_error' : 'upstream_error',
+        code: failure.code,
       },
     });
   }
 
-  // The only bound on how much of a slow client's backlog is held in memory.
-  const passThrough = new PassThrough({ highWaterMark: 64 * 1024 });
-
-  const result = await relayStream({
-    body: opened.body,
-    commitDeadlineMs: deps.commitDeadlineMs,
-    signal: controller.signal,
-    countTokens: (text) => countTokens(text),
-    // Asked of the profile, because where a provider puts usage is a provider
-    // fact and belongs in exactly one place.
-    extractUsage: (chunk) => profile.extractUsage(chunk),
-    // A request that named no ceiling still gets one. The budget already
-    // reserved this much, and a model that ignores max_tokens would otherwise
-    // bill a tenant for a generation nobody bounded.
-    maxCompletionTokens: chatRequest.max_tokens ?? DEFAULT_MAX_TOKENS,
-    commit: () => {
-      void reply
-        .header('content-type', 'text/event-stream; charset=utf-8')
-        // no-transform is what stops a compression layer collapsing the stream
-        // into one burst, which no assertion on the frames would ever catch.
-        .header('cache-control', 'no-cache, no-transform')
-        .header('connection', 'keep-alive')
-        .header('x-accel-buffering', 'no')
-        .header('x-modelgate-provider', opened.provider)
-        .header('x-modelgate-cache', 'bypass')
-        .code(200)
-        .send(passThrough);
-      return passThrough;
-    },
-  });
-
-  reply.raw.off('close', onClose);
+  const opened = finalOpened;
+  const result = finalResult;
 
   const promptTokens = result.providerUsage?.prompt_tokens ?? prompt;
   const spent = result.providerUsage?.total_tokens ?? promptTokens + result.completionTokens;
@@ -338,33 +458,13 @@ async function streamCompletion(args: {
     promptTokens,
     completionTokens: result.completionTokens,
     rawCompletion: result.completionText,
-    attempts: [
-      {
-        attemptNo: 1,
-        provider: opened.provider,
-        outcome: result.outcome === 'stream_abort' ? 'stream_abort'
-          : result.outcome === 'truncated_clean' ? 'truncated_clean'
-          : result.outcome === 'in_band_error' ? 'http_error'
-          : 'ok',
-        httpStatus: opened.status,
-        errorCode: result.errorMessage === null ? null : 'upstream_stream_error',
-        latencyMs: opened.latencyMs,
-        committed: result.committed,
-        providerRequestId: null,
-      },
-    ],
+    attempts,
   });
 
   if (!result.committed) {
-    // The stream opened and then died without producing anything. Nothing has
-    // been sent, so this can still be an honest error rather than an empty 200.
-    return reply.code(502).send({
-      error: {
-        message: result.errorMessage ?? 'the provider opened a stream and sent nothing',
-        type: 'upstream_error',
-        code: 'empty_stream',
-      },
-    });
+    // Only a caller abort can reach here. Every provider failure before the
+    // commit point was retried or failed over above.
+    return reply;
   }
 
   // Ending the sink is what told Fastify the response was done, so the

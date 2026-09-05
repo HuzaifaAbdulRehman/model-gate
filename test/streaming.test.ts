@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import type pg from 'pg';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config.js';
+import { completionFor } from '../src/mock/tokens.js';
 import { ProviderClient } from '../src/providers/client.js';
 import type { Cache } from '../src/redis.js';
 import { buildServer } from '../src/server.js';
@@ -18,15 +19,29 @@ interface Harness {
   url: string;
   app: FastifyInstance;
   provider: RunningMock;
+  primary: RunningMock;
+  backup: RunningMock;
   close: () => Promise<void>;
 }
 
 let open: Harness | null = null;
 
 async function harness(
-  options: { fails?: string; env?: Record<string, string> } = {},
+  options: {
+    fails?: string;
+    primaryFails?: string;
+    backupFails?: string;
+    env?: Record<string, string>;
+  } = {},
 ): Promise<Harness> {
-  const provider = await startMock(options.fails !== undefined ? { alwaysFail: options.fails } : {});
+  const primaryFailure = options.primaryFails ?? options.fails;
+  const backupFailure = options.backupFails ?? options.fails;
+  const primary = await startMock(
+    primaryFailure === undefined ? {} : { alwaysFail: primaryFailure },
+  );
+  const backup = await startMock(
+    backupFailure === undefined ? {} : { alwaysFail: backupFailure },
+  );
   const config = loadConfig({
     NODE_ENV: 'test',
     LOG_LEVEL: 'silent',
@@ -34,8 +49,8 @@ async function harness(
     REDIS_URL: 'redis://localhost:6380',
     GATEWAY_API_KEY: API_KEY,
     REDACTION_PEPPER: 'p'.repeat(32),
-    MOCK_PRIMARY_URL: provider.url,
-    MOCK_BACKUP_URL: provider.url,
+    MOCK_PRIMARY_URL: primary.url,
+    MOCK_BACKUP_URL: backup.url,
     ...options.env,
   });
   const client = new ProviderClient();
@@ -47,11 +62,14 @@ async function harness(
   return {
     url: `http://127.0.0.1:${address.port}`,
     app,
-    provider,
+    provider: primary,
+    primary,
+    backup,
     close: async () => {
       await app.close();
       await client.close();
-      await provider.close();
+      await primary.close();
+      await backup.close();
     },
   };
 }
@@ -167,6 +185,69 @@ describe('the commit point', () => {
     expect(body.error.type).toBe('upstream_error');
   });
 
+  it('fails over on a rate limit before committing', async () => {
+    open = await harness({ primaryFails: '429' });
+    const res = await ask(open.url);
+    const got = await readSse(res);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-modelgate-provider')).toBe('mock-backup');
+    expect(got.text).toBe(completionFor(1, 24));
+    expect(got.events).not.toContain('error');
+    expect(got.sawDone).toBe(true);
+    expect(open.primary.count()).toBe(1);
+    expect(open.backup.count()).toBe(1);
+  });
+
+  it('retries an empty broken stream, then fails over cleanly', async () => {
+    open = await harness({
+      primaryFails: 'abort@0',
+      env: { RETRY_BASE_MS: '0', RETRY_CAP_MS: '1' },
+    });
+    const res = await ask(open.url);
+    const got = await readSse(res);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-modelgate-provider')).toBe('mock-backup');
+    expect(got.text).toBe(completionFor(1, 24));
+    expect(got.unparsable).toEqual([]);
+    expect(got.events).not.toContain('error');
+    expect(
+      got.payloads.filter((payload) => payload.includes('"role":"assistant"')),
+    ).toHaveLength(1);
+    expect(open.primary.count()).toBe(2);
+    expect(open.backup.count()).toBe(1);
+  });
+
+  it('records every pre-commit attempt and the provider that won', async () => {
+    open = await harness({
+      primaryFails: 'abort@0',
+      env: {
+        MAX_ATTEMPTS_PER_PROVIDER: '1',
+        RETRY_BASE_MS: '0',
+        RETRY_CAP_MS: '1',
+      },
+    });
+    await stream(open.url);
+
+    for (let i = 0; i < 60; i += 1) {
+      const { rows } = await db.query<{
+        provider: string;
+        outcome: string;
+        committed: boolean;
+      }>('SELECT provider, outcome, committed FROM request_attempts ORDER BY attempt_no');
+      if (rows.length === 2) {
+        expect(rows).toEqual([
+          { provider: 'mock-primary', outcome: 'stream_abort', committed: false },
+          { provider: 'mock-backup', outcome: 'ok', committed: true },
+        ]);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error('streaming failover attempts were not recorded');
+  });
+
   it('answers a rejected request with a clean 400', async () => {
     open = await harness({ fails: 'bad-request' });
     const res = await ask(open.url);
@@ -174,6 +255,7 @@ describe('the commit point', () => {
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: { type: string } };
     expect(body.error.type).toBe('invalid_request_error');
+    expect(open.backup.count()).toBe(0);
   });
 
   it('reports an opened stream that produced nothing as an error', async () => {
@@ -200,6 +282,7 @@ describe('a stream that dies after committing', () => {
     expect(got.events).toContain('error');
     expect(got.finishReason).toBe('modelgate_interrupted');
     expect(got.sawDone).toBe(true);
+    expect(open.backup.count()).toBe(0);
   });
 
   it('catches a clean end that no error or timeout would reveal', async () => {

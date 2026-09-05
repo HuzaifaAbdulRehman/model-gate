@@ -172,6 +172,25 @@ It also had a consequence for the tests. The mock's deltas were word-aligned, so
 end-to-end test could tell a correct counter from a broken one. The mock now has a
 `splitDeltas` mode that cuts words in half, and the accounting test runs against it.
 
+## Measured in phase 5: commitment is the failover boundary
+
+Streaming now walks the configured provider order. An HTTP failure, or a stream
+that ends before its first content delta, can retry and move to the next
+provider. Buffered role and error frames from failed attempts are discarded, so
+the caller receives one clean stream from the provider that answered.
+
+Once a content delta commits the HTTP 200 response, the gateway does not retry.
+Replaying the request then would duplicate text the caller has already
+displayed. The relay emits an SSE error frame, a
+`finish_reason: "modelgate_interrupted"` frame and one `[DONE]` marker instead.
+The guarantee is zero duplicated output and zero silent truncation.
+
+Tier 2 continuation was not built. Without evidence from a live provider,
+synthetic continuation and overlap removal would add a path whose seam quality
+cannot be validated. The mock tests prove clean pre-commit failover and honest
+post-commit termination; they do not claim that one model can resume another
+model's sampling state.
+
 ## Carried forward from the phase 3 review
 
 **Backpressure is implemented but not directly tested.** The relay waits on
@@ -179,14 +198,6 @@ end-to-end test could tell a correct counter from a broken one. The mock now has
 on a destroyed stream, so an unsignalled wait deadlocks the moment a client hangs up. What
 is missing is a test with a deliberately slow reader asserting the gateway's memory stays
 bounded. Worth adding at phase 6, where the measurement harness already exists.
-
-**Streaming has no failover.** It uses the first provider and stops. The commit point is
-built and the relay reports whether anything was flushed, so Tier 1 is a small step from
-here, but it is phase 5 work and pretending otherwise would be a lie in the README.
-
-**In-stream token counting is one frame, one token.** Cheap and roughly right, and it is
-labelled `estimated` everywhere it lands. Phase 4 replaces it with a periodic exact
-re-encode reconciled against the provider's usage frame.
 
 **A rate limit now passes through as 429 rather than 502.** Changed during this phase after
 reflection, not to make a test pass. 502 says the upstream is broken and invites an alert;
