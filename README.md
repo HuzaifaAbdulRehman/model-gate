@@ -68,7 +68,9 @@ guarantee breaks. Run `docker compose down` when finished.
 
 The test suite uses TCP mock providers that can hang, rate-limit, truncate a
 frame, close cleanly without a terminal frame, or reset a socket at a selected
-content offset. It currently contains 222 unit and integration tests.
+content offset. It currently contains 225 unit and integration tests. One test
+holds a downstream write open and verifies the gateway stops pulling upstream
+until the client drains.
 
 ## Measurements
 
@@ -96,8 +98,29 @@ post-commit failures ended with an error event, an interruption finish reason,
 and `[DONE]`; none stopped silently.
 
 The benchmark also reports token-estimate disagreement against the mock. That
-is a harness diagnostic, not provider ground truth. Live Groq calibration has
-not been run, so the README makes no claim about real-provider estimate error.
+is a harness diagnostic, not provider ground truth.
+
+### Live Groq check
+
+`npm run validate:groq` requires `GROQ_API_KEY` in `.env`. It uses
+`openai/gpt-oss-20b`, which Groq currently lists as a production model, and
+sends only synthetic prompts. The script uses an isolated database and Redis
+namespace, then removes its data. See Groq's
+[model page](https://console.groq.com/docs/model/openai/gpt-oss-20b) and
+[prefill documentation](https://console.groq.com/docs/prefilling).
+
+On 6 September 2026, all 26 requests passed through ModelGate and all 26 audit
+rows used provider-reported usage. The original prompt estimate was 63 to 66
+tokens below Groq across five prompt shapes. A model-specific 64-token offset
+reduced the residual to -2 through +1 tokens: 0% median absolute error and
+2.04% maximum.
+
+The prefill experiment ended the supplied prefix halfway through a word. In all
+20 trials, Groq returned the full prefix followed by the expected remainder.
+A gateway would have to remove that overlap before forwarding the response.
+This exact-output test does not establish coherent continuation for an
+open-ended answer, so ModelGate still terminates an interrupted stream
+explicitly.
 
 ## Boundaries
 
@@ -112,6 +135,6 @@ recognises structured formats; it cannot reliably detect names, street
 addresses, or free-text descriptions of a person.
 
 ModelGate currently uses one static gateway key and one tenant. It does not
-include billing, semantic caching, a dashboard, or a public deployment. The
-Groq profile is wired in, but the measured results above use only the local
-mock provider.
+include billing, semantic caching, a dashboard, or a public deployment. Local
+performance numbers use the deterministic mock; Groq is used only by the
+opt-in validation command.

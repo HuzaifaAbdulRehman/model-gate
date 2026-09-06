@@ -7,14 +7,9 @@ export type Encoding = 'o200k_base' | 'cl100k_base';
 /**
  * Chat framing overhead, in tokens.
  *
- * These are the ChatML numbers. They are correct for the OpenAI 4o and 5 era
- * and they are NOT verified for gpt-oss harmony framing, which is what the Groq
- * free tier serves. Calibrating those properly needs ground truth from a live
- * provider: Groq returns an exact input count under `x_groq.debug.input_tokens`
- * when `debug: true` is set, so the honest fix is to fit the constants against
- * it and commit the fitted numbers with the date and method. Until then this is
- * an approximation, and the estimate error is a measured output of phase 6
- * rather than something to be quietly assumed away.
+ * These are the ChatML numbers used for the OpenAI 4o and 5 era. Providers can
+ * add their own model wrapper on top. Keep that measured adjustment separate
+ * instead of changing the shared constants to fit one provider.
  */
 const FRAMING = {
   /** Added once for the whole conversation. */
@@ -26,6 +21,16 @@ const FRAMING = {
   /** The assistant turn the model is about to start. */
   replyPrimer: 3,
 } as const;
+
+/**
+ * Groq reported 63 to 66 more input tokens than the shared estimate across
+ * five prompt shapes on 6 September 2026. A fixed 64-token adjustment reduced
+ * the residual to -2 through +1 without fitting role-specific constants to one
+ * sample. This model id is exact on purpose; no other model was measured.
+ */
+const MODEL_PROMPT_OVERHEAD: Readonly<Record<string, number>> = {
+  'openai/gpt-oss-20b': 64,
+};
 
 /**
  * A completion ceiling used when the caller did not name one.
@@ -74,7 +79,10 @@ function contentToText(content: unknown): string {
 /** Estimated prompt tokens, framing included. */
 export function estimatePromptTokens(request: ChatRequest): number {
   const encoding = encodingFor(request.model);
-  let total = FRAMING.bosOnce + FRAMING.replyPrimer;
+  let total =
+    FRAMING.bosOnce +
+    FRAMING.replyPrimer +
+    (MODEL_PROMPT_OVERHEAD[request.model] ?? 0);
 
   for (const message of request.messages) {
     total += FRAMING.perMessage;

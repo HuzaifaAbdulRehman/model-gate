@@ -67,11 +67,13 @@ the point of the ordering, not an accident of it.
 | 4 | Token accounting through the stream. Three counters, reconciliation, `token_source` | per-delta re-encode is never used, reconciliation matches provider usage on a clean stream |
 | 5 | Mid-stream failover. Tier 1, then Tier 3, then Tier 2 timeboxed | zero duplicated characters at the seam, zero silent truncations, both asserted by tests |
 | 6 | Measurement, then the honest README | numbers in the README came from a script in the repo |
+| 7 | Backpressure proof. A blocked writable stands in for a slow caller | upstream pulls stop before memory grows with the response |
+| 8 | Live Groq validation. Prompt accounting, streaming and prefill | dated provider results come from an opt-in script and no secret enters Git |
 
-Two changes from the brief's build order. Its stage 2 was one bullet hiding four
-subsystems, so it splits into phases 0 and 2 here. And the Groq prefill experiment moves up
-to phase 1: it costs an hour, and its answer decides whether Tier 2 has a prefill path at
-all. Finding that out at phase 5 would be a waste.
+The brief's stage 2 was one bullet hiding four subsystems, so it split into
+phases 0 and 2 here. The Groq prefill experiment was planned for phase 1, but no
+key was available then. The deterministic path stayed shippable without it,
+and the live experiment ran in phase 8 when a key became available.
 
 ### The three failover tiers
 
@@ -109,7 +111,7 @@ Detail and sources in `RESEARCH.md`.
 | Redaction | One choke point behind a branded `Redacted` type, so passing a raw prompt is a type error rather than a code-review catch |
 | Ordering trap | Cache key over the raw prompt, audit record over the redacted one. Reversed, two prompts differing only by an email collide and you serve user A's completion to user B |
 | Infra | Docker Engine inside WSL2. Already running, no Docker Desktop, and `docker compose up` in the README stays literally true |
-| Providers | Mock through phases 1 to 5. Groq wired in at phase 6 for real numbers. The Azure key stays untouched |
+| Providers | Mock for deterministic tests and local performance. Groq is an opt-in live validation path. The Azure key stays untouched |
 | Dependencies | `libphonenumber-js` and pino's `redact`. Nothing else for redaction, because the alternatives are abandoned, Python, or marketing |
 
 Not building: semantic caching, a reservation sweeper, Redis Functions, reversible PII
@@ -202,31 +204,49 @@ of 50 interrupted streams ended silently.
 
 These are loopback mock measurements on one laptop. They measure gateway code,
 local Redis and local PostgreSQL; they say nothing about model generation or
-internet latency. Live Groq token calibration remains undone and is named as
-such in the README.
+internet latency.
 
 `npm run demo` uses the same isolated approach for a shorter visible check. It
 shows one clean pre-commit failover and one explicit post-commit interruption,
 then exits non-zero if either guarantee breaks.
 
-## Carried forward from the phase 3 review
+## Measured in phase 7: slow readers stop upstream pulls
 
-**Backpressure is implemented but not directly tested.** The relay waits on
-`drain` with the abort signal attached, which is the part that matters: `drain` never fires
-on a destroyed stream, so an unsignalled wait deadlocks the moment a client hangs up. What
-is missing is a test with a deliberately slow reader asserting the gateway's memory stays
-bounded. Worth adding at phase 6, where the measurement harness already exists.
+A controlled writable with a one-byte high-water mark held its first callback
+while the mock body offered 5,003 frames. The relay pulled two frames, then
+stopped until the sink drained. With the drain wait deliberately removed, it
+pulled all 5,003 and the test failed. This proves the relay obeys a writable's
+backpressure signal. The route's `PassThrough` remains bounded at 64 KiB, and
+the production relay itself did not need to change.
+
+## Measured in phase 8: Groq adds a fixed prompt cost
+
+`npm run validate:groq` sent 26 synthetic requests through the complete
+gateway on 6 September 2026 using `openai/gpt-oss-20b`. Non-streaming and
+streaming requests completed, every audit row used provider usage, and the key
+remained in the ignored `.env` file.
+
+Across five prompt shapes, Groq counted 63 to 66 more input tokens than the
+shared estimate. A 64-token adjustment for this exact model reduced the
+residual to -2 through +1 tokens, with 0% median and 2.04% maximum absolute
+error. No adjustment was inferred for an unmeasured model.
+
+The 20 prefill trials cut the supplied text halfway through a word. Groq
+returned the full prefix and the expected remainder every time. That supports
+exact overlap removal, but it does not answer whether an open-ended response
+would stay coherent across two models. Tier 2 continuation remains out.
+
+## Carried forward from the phase 3 review
 
 **A rate limit now passes through as 429 rather than 502.** Changed during this phase after
 reflection, not to make a test pass. 502 says the upstream is broken and invites an alert;
 429 with a retry-after says the quota is spent and says when to come back.
 
-## Carried forward from the phase 2a review
+## Resolved from the phase 2a review
 
-**No total deadline across the chain.** Each provider call is bounded, but the worst case is
-providers times attempts times timeout, plus backoff. A caller can wait a long time for a
-502 that was inevitable after the first provider. Needs one deadline over the whole
-dispatch, checked between attempts. Phase 2b.
+**One deadline now bounds the whole provider chain.** It is checked before
+every dispatch, so per-provider retries cannot multiply the caller's wait
+without limit.
 
 **Undici's timeouts are coarse, and this is measured rather than assumed.** With
 `headersTimeout` set to 200ms, the first attempt actually failed at roughly 1.2 seconds and
@@ -249,8 +269,8 @@ covering their range, so the repair becomes a data move rather than a DDL. A can
 asserts named partitions cover at least the next 30 days, so this fails loudly rather than
 silently. Clean clones and CI are unaffected because both migrate fresh.
 
-**Cache keys need a version prefix** when the cache arrives in phase 2. A shared Redis
-outlives every deploy, so without one, new code deserializes a payload the old code wrote.
+**Cache keys have a version prefix.** A shared Redis outlives a deploy, so new
+code must not deserialize a payload written under an older format.
 
 **The Dockerfile, when it exists, must use `CMD ["node", "dist/index.js"]`.** Not npm and
 not a shell form. Neither forwards SIGTERM, which would make the graceful shutdown in
@@ -259,19 +279,10 @@ not a shell form. Neither forwards SIGTERM, which would make the graceful shutdo
 **Bring the stack up with `docker compose up -d --wait`.** A bare `up -d` exits 0 as soon as
 containers are created, so a service crash-looping on bad config still reports success.
 
-**CI has never run.** The workflow is written and its shape matches HookRelay's working
-one, but GitHub Actions cannot be executed locally, so it stays unverified until the first
-push.
+**CI runs on GitHub.** The phase 6 push passed install, typecheck, build and all
+tests from a fresh runner.
 
-## Open questions
-
-Does Groq prefill resume from a mid-sentence cut, or restart? Nobody has published this.
-Phase 1 experiment, twenty samples, and the answer goes in the README as an original
-finding.
-
-The gpt-oss chat framing constants are unverified. Calibrate them against
-`x_groq.debug.input_tokens`, then commit the fitted numbers with the date and method. Do
-not guess and call it fact.
+## Open question
 
 Client disconnect policy is unsettled. Either record `estimated` and abort upstream
 immediately, or drain upstream to capture usage. Currently leaning towards aborting:

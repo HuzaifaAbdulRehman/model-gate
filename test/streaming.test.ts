@@ -1,11 +1,14 @@
+import { Writable } from 'node:stream';
 import type { FastifyInstance } from 'fastify';
 import type pg from 'pg';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config.js';
+import { contentFrame, doneFrame, finishFrame, roleFrame } from '../src/mock/sse.js';
 import { completionFor } from '../src/mock/tokens.js';
 import { ProviderClient } from '../src/providers/client.js';
 import type { Cache } from '../src/redis.js';
 import { buildServer } from '../src/server.js';
+import { relayStream } from '../src/streaming/relay.js';
 import { createTestPool, createTestRedis, truncateAll, waitForRedis } from './helpers/db.js';
 import { TEST_DATABASE_URL } from './helpers/global-setup.js';
 import { readSse, startMock, type Collected, type RunningMock } from './helpers/mock.js';
@@ -152,6 +155,76 @@ describe('relaying a healthy stream', () => {
     const got = await stream(open.url, { max_tokens: 200 });
 
     expect(got.text).not.toContain('�');
+  });
+});
+
+describe('backpressure', () => {
+  it('stops pulling upstream while a slow client is blocked', async () => {
+    const opts = {
+      id: 'chatcmpl-backpressure',
+      created: 1,
+      model: 'mock-1',
+      dialect: 'openai' as const,
+      obfuscation: false,
+      crlf: false,
+    };
+    const encoder = new TextEncoder();
+    const totalContentFrames = 5_000;
+    let yielded = 0;
+
+    async function* body(): AsyncGenerator<Uint8Array> {
+      yielded += 1;
+      yield encoder.encode(roleFrame(opts));
+      for (let index = 0; index < totalContentFrames; index += 1) {
+        yielded += 1;
+        yield encoder.encode(contentFrame(opts, 'word '));
+      }
+      yielded += 1;
+      yield encoder.encode(finishFrame(opts, 'stop'));
+      yielded += 1;
+      yield encoder.encode(doneFrame(opts));
+    }
+
+    let markFirstWriteStarted: () => void = () => undefined;
+    const firstWriteStarted = new Promise<void>((resolve) => {
+      markFirstWriteStarted = resolve;
+    });
+    const gate: { release?: () => void } = {};
+    let writes = 0;
+    const sink = new Writable({
+      highWaterMark: 1,
+      write(_chunk, _encoding, callback) {
+        writes += 1;
+        if (writes === 1) {
+          gate.release = callback;
+          markFirstWriteStarted();
+          return;
+        }
+        callback();
+      },
+    });
+
+    const relayed = relayStream({
+      body: body(),
+      commit: () => sink,
+      commitDeadlineMs: 5_000,
+      signal: new AbortController().signal,
+    });
+
+    await firstWriteStarted;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // One role frame and the first content frame are enough to reach commit.
+    // The other 4,999 frames must remain upstream until the sink drains.
+    expect(yielded).toBe(2);
+    expect(sink.writableLength).toBe(Buffer.byteLength(roleFrame(opts)));
+
+    gate.release?.();
+    const result = await relayed;
+
+    expect(result.outcome).toBe('complete');
+    expect(result.contentFrames).toBe(totalContentFrames);
+    expect(yielded).toBe(totalContentFrames + 3);
   });
 });
 
