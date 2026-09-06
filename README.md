@@ -52,6 +52,9 @@ pre-commit failover to `mock-backup`, then a post-commit failure from
 `mock-primary` with its explicit terminal error. It exits non-zero if either
 guarantee breaks. Run `docker compose down` when finished.
 
+For the one-minute talk track and the longer design explanation, see
+[`docs/INTERVIEW.md`](docs/INTERVIEW.md).
+
 ## What is implemented
 
 - Retry and ordered provider failover for regular and streaming completions.
