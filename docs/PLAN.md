@@ -69,6 +69,7 @@ the point of the ordering, not an accident of it.
 | 6 | Measurement, then the honest README | numbers in the README came from a script in the repo |
 | 7 | Backpressure proof. A blocked writable stands in for a slow caller | upstream pulls stop before memory grows with the response |
 | 8 | Live Groq validation. Prompt accounting, streaming and prefill | dated provider results come from an opt-in script and no secret enters Git |
+| 9 | Correctness closeout. Hard deadlines, truthful stream attempts, deterministic audit waits | deadline and audit regressions fail focused tests; the complete suite stays green |
 
 The brief's stage 2 was one bullet hiding four subsystems, so it split into
 phases 0 and 2 here. The Groq prefill experiment was planned for phase 1, but no
@@ -236,6 +237,30 @@ returned the full prefix and the expected remainder every time. That supports
 exact overlap removal, but it does not answer whether an open-ended response
 would stay coherent across two models. Tier 2 continuation remains out.
 
+## Verified in phase 9: deadlines stop live work
+
+`REQUEST_DEADLINE_MS` now aborts the provider call that is in progress. A
+regular request or an uncommitted stream gets a clean 502 with
+`gateway_deadline_exceeded`. A stream that already sent content keeps its HTTP
+200 status and ends with the same code in an SSE error frame, followed by an
+interruption finish reason and one `[DONE]` marker.
+
+Streaming attempt rows now store the provider request ID and the bytes and
+tokens sent to the caller. The parent request also records `stream = true`.
+This matters on pre-commit failover: the audit trail shows that the failed
+provider sent zero bytes before the backup won.
+
+The cheap runaway guard now reacts to bytes rather than frame count, so one
+large provider delta cannot slip through a 64-delta recount cadence. Its next
+trigger advances after an exact count, which keeps prefix tokenization off the
+per-delta path.
+
+Four intentional regressions were caught by focused tests: removing the live
+deadline abort, restoring frame-count tripwires, removing the tokenizer
+margin, and recording a stream as a regular request. Test startup now clears
+its PostgreSQL and Redis state before the first file, so a timed-out process
+cannot poison the next targeted run.
+
 ## Carried forward from the phase 3 review
 
 **A rate limit now passes through as 429 rather than 502.** Changed during this phase after
@@ -244,9 +269,10 @@ reflection, not to make a test pass. 502 says the upstream is broken and invites
 
 ## Resolved from the phase 2a review
 
-**One deadline now bounds the whole provider chain.** It is checked before
-every dispatch, so per-provider retries cannot multiply the caller's wait
-without limit.
+**One deadline now bounds the whole provider chain.** A timer aborts the active
+provider request, and retry waits are capped by the time left. Checking only
+between attempts was not enough because one provider could ignore the chain's
+remaining time.
 
 **Undici's timeouts are coarse, and this is measured rather than assumed.** With
 `headersTimeout` set to 200ms, the first attempt actually failed at roughly 1.2 seconds and
@@ -282,9 +308,10 @@ containers are created, so a service crash-looping on bad config still reports s
 **CI runs on GitHub.** The phase 6 push passed install, typecheck, build and all
 tests from a fresh runner.
 
-## Open question
+## Client disconnect policy
 
-Client disconnect policy is unsettled. Either record `estimated` and abort upstream
-immediately, or drain upstream to capture usage. Currently leaning towards aborting:
-holding a provider connection open past the client's is a worse property for a gateway than
-a slightly drifted number.
+ModelGate aborts upstream work as soon as the caller disconnects. It records
+the relayed prefix as `partial_estimated`, because the provider usage frame
+usually never arrives on an interrupted stream. Draining solely to collect
+usage would keep spending tokens and occupy a provider connection after there
+is nobody left to receive the answer.

@@ -9,6 +9,7 @@ import { ProviderClient } from '../src/providers/client.js';
 import type { Cache } from '../src/redis.js';
 import { buildServer } from '../src/server.js';
 import { relayStream } from '../src/streaming/relay.js';
+import { countTokens } from '../src/tokens/counter.js';
 import { createTestPool, createTestRedis, truncateAll, waitForRedis } from './helpers/db.js';
 import { TEST_DATABASE_URL } from './helpers/global-setup.js';
 import { readSse, startMock, type Collected, type RunningMock } from './helpers/mock.js';
@@ -228,6 +229,95 @@ describe('backpressure', () => {
   });
 });
 
+describe('the runaway tripwire', () => {
+  it('recounts one oversized delta before pulling another packet', async () => {
+    const opts = {
+      id: 'chatcmpl-oversized-delta',
+      created: 1,
+      model: 'mock-1',
+      dialect: 'openai' as const,
+      obfuscation: false,
+      crlf: false,
+    };
+    const encoder = new TextEncoder();
+    const oversized = 'indivisibility '.repeat(20);
+    let yielded = 0;
+
+    async function* body(): AsyncGenerator<Uint8Array> {
+      yielded += 1;
+      yield encoder.encode(roleFrame(opts));
+      for (let index = 0; index < 10; index += 1) {
+        yielded += 1;
+        yield encoder.encode(contentFrame(opts, oversized));
+      }
+    }
+
+    const sink = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+    const result = await relayStream({
+      body: body(),
+      commit: () => sink,
+      commitDeadlineMs: 5_000,
+      signal: new AbortController().signal,
+      countTokens,
+      maxCompletionTokens: 5,
+    });
+
+    expect(result.budgetStopped).toBe(true);
+    expect(result.contentFrames).toBe(1);
+    expect(result.completionTokens).toBeGreaterThan(5);
+    expect(yielded).toBe(2);
+  });
+
+  it('moves its cheap trigger after an exact count', async () => {
+    const opts = {
+      id: 'chatcmpl-tripwire-cadence',
+      created: 1,
+      model: 'mock-1',
+      dialect: 'openai' as const,
+      obfuscation: false,
+      crlf: false,
+    };
+    const encoder = new TextEncoder();
+    let recounts = 0;
+
+    async function* body(): AsyncGenerator<Uint8Array> {
+      yield encoder.encode(roleFrame(opts));
+      for (let index = 0; index < 50; index += 1) {
+        yield encoder.encode(contentFrame(opts, 'abcdefghij'));
+      }
+      yield encoder.encode(finishFrame(opts, 'stop'));
+      yield encoder.encode(doneFrame(opts));
+    }
+
+    const sink = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+    const result = await relayStream({
+      body: body(),
+      commit: () => sink,
+      commitDeadlineMs: 5_000,
+      signal: new AbortController().signal,
+      countTokens: (text) => {
+        recounts += 1;
+        return Math.ceil(text.length / 10);
+      },
+      maxCompletionTokens: 100,
+      recountEveryDeltas: 1_000,
+      recountEveryMs: 60_000,
+    });
+
+    expect(result.outcome).toBe('complete');
+    expect(result.completionTokens).toBe(50);
+    expect(recounts).toBeLessThan(10);
+  });
+});
+
 describe('the commit point', () => {
   it('commits on the first content delta rather than waiting out the deadline', async () => {
     // With a five second deadline, a stream that only committed on the timer
@@ -303,23 +393,42 @@ describe('the commit point', () => {
     });
     await stream(open.url);
 
-    for (let i = 0; i < 60; i += 1) {
-      const { rows } = await db.query<{
-        provider: string;
-        outcome: string;
-        committed: boolean;
-      }>('SELECT provider, outcome, committed FROM request_attempts ORDER BY attempt_no');
-      if (rows.length === 2) {
-        expect(rows).toEqual([
-          { provider: 'mock-primary', outcome: 'stream_abort', committed: false },
-          { provider: 'mock-backup', outcome: 'ok', committed: true },
-        ]);
-        return;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    throw new Error('streaming failover attempts were not recorded');
-  });
+    await expect
+      .poll(
+        async () =>
+          Number((await db.query('SELECT count(*) AS count FROM request_attempts')).rows[0]?.count),
+        { interval: 25, timeout: 5_000 },
+      )
+      .toBe(2);
+
+    const { rows } = await db.query<{
+      provider: string;
+      outcome: string;
+      committed: boolean;
+      provider_request_id: string | null;
+      bytes_flushed: number | null;
+      tokens_flushed: number | null;
+    }>(
+      `SELECT provider, outcome, committed, provider_request_id,
+              bytes_flushed, tokens_flushed
+         FROM request_attempts
+        ORDER BY attempt_no`,
+    );
+    expect(
+      rows.map(({ provider, outcome, committed }) => ({ provider, outcome, committed })),
+    ).toEqual([
+      { provider: 'mock-primary', outcome: 'stream_abort', committed: false },
+      { provider: 'mock-backup', outcome: 'ok', committed: true },
+    ]);
+    expect(rows[0]).toMatchObject({ bytes_flushed: 0, tokens_flushed: 0 });
+    expect(rows[0]?.provider_request_id).toMatch(/^chatcmpl-/);
+    expect(rows[1]?.provider_request_id).toMatch(/^chatcmpl-/);
+    expect(Number(rows[1]?.bytes_flushed)).toBeGreaterThan(0);
+    expect(Number(rows[1]?.tokens_flushed)).toBeGreaterThan(0);
+
+    const requestRow = await db.query<{ stream: boolean }>('SELECT stream FROM requests');
+    expect(requestRow.rows).toEqual([{ stream: true }]);
+  }, 10_000);
 
   it('answers a rejected request with a clean 400', async () => {
     open = await harness({ fails: 'bad-request' });
@@ -340,6 +449,43 @@ describe('the commit point', () => {
     expect(res.status).toBe(502);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe('empty_stream');
+  });
+});
+
+describe('the request deadline', () => {
+  it('returns a clean error when a stream stalls before content', async () => {
+    open = await harness({
+      primaryFails: 'hang',
+      env: {
+        REQUEST_DEADLINE_MS: '100',
+        PROVIDER_BODY_TIMEOUT_MS: '10000',
+        MAX_ATTEMPTS_PER_PROVIDER: '1',
+      },
+    });
+    const res = await ask(open.url);
+
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe('gateway_deadline_exceeded');
+    expect(open.primary.count()).toBe(1);
+    expect(open.backup.count()).toBe(0);
+  });
+
+  it('terminates an already committed stream in band', async () => {
+    open = await harness({
+      primaryFails: 'slow@200',
+      env: { REQUEST_DEADLINE_MS: '100', PROVIDER_BODY_TIMEOUT_MS: '10000' },
+    });
+    const got = await stream(open.url);
+
+    expect(got.text.length).toBeGreaterThan(0);
+    expect(got.events).toContain('error');
+    expect(
+      got.payloads.some((payload) => payload.includes('gateway_deadline_exceeded')),
+    ).toBe(true);
+    expect(got.finishReason).toBe('modelgate_interrupted');
+    expect(got.sawDone).toBe(true);
+    expect(open.backup.count()).toBe(0);
   });
 });
 

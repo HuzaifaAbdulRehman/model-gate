@@ -41,6 +41,10 @@ export interface RelayResult {
   errorMessage: string | null;
   /** The relayed completion, kept for the audit log. */
   completionText: string;
+  /** Provider response id observed on any frame, when one was sent. */
+  providerRequestId: string | null;
+  /** True when the gateway's whole-request ceiling ended the provider body. */
+  deadlineExceeded: boolean;
   /**
    * Best available completion count, and where it came from.
    *
@@ -73,6 +77,8 @@ export interface RelayOptions {
    */
   commitDeadlineMs: number;
   signal: AbortSignal;
+  /** Separate from the caller signal so a gateway timeout is not logged as a disconnect. */
+  deadlineSignal?: AbortSignal;
   /**
    * Counts a whole string. Called on the accumulated completion, never on one
    * delta.
@@ -120,19 +126,38 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
   const count = options.countTokens ?? ((text: string) => text.length);
   const recountEveryDeltas = options.recountEveryDeltas ?? 64;
   const recountEveryMs = options.recountEveryMs ?? 250;
+  // max_tokens is interpreted by the provider's tokenizer, which can differ
+  // slightly from ours. A small margin prevents a valid final token from being
+  // mislabeled as runaway while keeping a provider that ignores the limit
+  // bounded close to the requested amount.
+  const runawayTokenLimit =
+    options.maxCompletionTokens === undefined
+      ? undefined
+      : options.maxCompletionTokens + Math.max(4, Math.ceil(options.maxCompletionTokens * 0.1));
   /** Kept as pieces and joined on demand, so the common path does no copying. */
   const completionChunks: string[] = [];
   let completionTokens = 0;
+  let completionBytes = 0;
   let providerUsage: Usage | null = null;
   let budgetStopped = false;
   let deltasSinceRecount = 0;
   let lastRecountAt = Date.now();
+  let nextTripwireByte =
+    runawayTokenLimit === undefined ? Number.POSITIVE_INFINITY : runawayTokenLimit + 1;
   let stopping = false;
 
   const recount = (): void => {
     completionTokens = count(completionChunks.join(''));
     deltasSinceRecount = 0;
     lastRecountAt = Date.now();
+    if (runawayTokenLimit !== undefined) {
+      // Between exact samples, each appended byte can add at most one token.
+      // Move the cheap trigger forward by the remaining allowance so an early
+      // byte/token mismatch does not turn the rest of the stream into a
+      // per-delta re-encode.
+      const remaining = Math.max(0, runawayTokenLimit - completionTokens);
+      nextTripwireByte = completionBytes + Math.max(1, remaining);
+    }
   };
   const identity: { id: string | null; model: string | null; created: number | null } = {
     id: null,
@@ -207,6 +232,7 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
         if (view?.hasContent === true && view.content !== null) {
           contentFrames += 1;
           completionChunks.push(view.content);
+          completionBytes += Buffer.byteLength(view.content);
           deltasSinceRecount += 1;
 
           // Counter two. Exact, because it re-encodes the whole prefix, and
@@ -218,15 +244,16 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
             recount();
           }
 
-          // Counter one: the cheap running length, checked every delta. This is
-          // the only thing standing between a model that ignores max_tokens and
-          // a tenant billed for an unbounded generation.
+          // Counter one: UTF-8 bytes, updated on every delta. A token consumes
+          // at least one byte, so crossing the safety threshold in bytes is the
+          // cheap signal to run the exact counter. Counting deltas here misses
+          // a provider that packs a large response into only a few frames.
           if (
-            options.maxCompletionTokens !== undefined &&
-            Math.max(completionTokens, deltasSinceRecount) > options.maxCompletionTokens
+            runawayTokenLimit !== undefined &&
+            completionBytes >= nextTripwireByte
           ) {
             recount();
-            if (completionTokens > options.maxCompletionTokens) {
+            if (completionTokens > runawayTokenLimit) {
               budgetStopped = true;
               stopping = true;
             }
@@ -244,6 +271,11 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
 
         if (stopping) break;
       }
+
+      // Check before asking the async iterator for another chunk. Waiting for
+      // the next loop header pulls one more packet from the provider after the
+      // gateway has already decided to stop.
+      if (stopping) break;
     }
 
     // Whatever the provider managed to say before the socket went is still
@@ -262,8 +294,11 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
       if (out.sink === null) pending.push(tail.raw);
       else await write(tail.raw);
     }
-  } catch (err) {
-    if ((err as Error).name === 'AbortError') clientGone = true;
+  } catch {
+    // AbortError is also what Undici raises when the gateway deadline cancels
+    // the upstream body. The caller signal is the source of truth here; using
+    // the error name records gateway timeouts as client disconnects.
+    if (options.signal.aborted) clientGone = true;
     else transportFailed = true;
   } finally {
     clearTimeout(deadlineTimer);
@@ -278,6 +313,8 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
     finishReason,
     sawDone,
   });
+  const deadlineExceeded =
+    options.deadlineSignal?.aborted === true && transportFailed && !clientGone;
 
   // A stream that ended properly still has to reach the client, even if it
   // never produced a content delta: an empty answer is a valid answer.
@@ -294,14 +331,24 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
     // exists to prevent.
     if (outcome === 'stream_abort' || outcome === 'in_band_error' || budgetStopped) {
       const message = budgetStopped
-        ? 'stopped by the gateway: the completion passed the token ceiling for this request'
-        : (errorMessage ?? 'the provider stopped responding mid-stream');
+        ? 'stopped by the gateway: the completion passed the token ceiling safety margin'
+        : deadlineExceeded
+          ? 'stopped by the gateway: the request passed its deadline'
+          : (errorMessage ?? 'the provider stopped responding mid-stream');
       await write(
         `event: error\ndata: ${JSON.stringify({
           error: {
             message,
-            type: budgetStopped ? 'rate_limit_exceeded' : 'upstream_error',
-            code: budgetStopped ? 'modelgate_budget_exceeded' : 'modelgate_interrupted',
+            type: budgetStopped
+              ? 'rate_limit_exceeded'
+              : deadlineExceeded
+                ? 'timeout_error'
+                : 'upstream_error',
+            code: budgetStopped
+              ? 'modelgate_budget_exceeded'
+              : deadlineExceeded
+                ? 'gateway_deadline_exceeded'
+                : 'modelgate_interrupted',
           },
         })}\n\n`,
       );
@@ -342,6 +389,8 @@ export async function relayStream(options: RelayOptions): Promise<RelayResult> {
     finishReason,
     errorMessage,
     completionText: completionChunks.join(''),
+    providerRequestId: identity.id,
+    deadlineExceeded,
     completionTokens: providerUsage?.completion_tokens ?? completionTokens,
     providerUsage,
     tokenSource: providerUsage !== null ? 'provider' : 'estimated',

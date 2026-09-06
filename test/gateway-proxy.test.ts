@@ -432,6 +432,50 @@ describe('the chain deadline', () => {
     expect(res.headers['x-modelgate-attempts']).toBe('1');
     expect(open.backup.count()).toBe(0);
   });
+
+  it('aborts an in-flight call at the whole-chain deadline', async () => {
+    open = await harness({
+      primaryFails: 'hang',
+      env: {
+        REQUEST_DEADLINE_MS: '100',
+        PROVIDER_HEADERS_TIMEOUT_MS: '10000',
+        MAX_ATTEMPTS_PER_PROVIDER: '1',
+      },
+    });
+    const startedAt = Date.now();
+    const res = await chat(open.app);
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error.code).toBe('gateway_deadline_exceeded');
+    expect(res.headers['x-modelgate-attempts']).toBe('1');
+    expect(open.primary.count()).toBe(1);
+    expect(open.backup.count()).toBe(0);
+    expect(elapsedMs).toBeLessThan(1_000);
+    expect(res.headers['x-modelgate-provider']).toBeUndefined();
+
+    await expect
+      .poll(
+        async () =>
+          Number((await db.query('SELECT count(*) AS count FROM requests')).rows[0]?.count),
+        { interval: 25, timeout: 5_000 },
+      )
+      .toBe(1);
+    const requestRow = await db.query<{ final_provider: string | null }>(
+      'SELECT final_provider FROM requests',
+    );
+    expect(requestRow.rows).toEqual([{ final_provider: null }]);
+    const attemptRow = await db.query<{ provider: string; outcome: string; error_code: string }>(
+      'SELECT provider, outcome, error_code FROM request_attempts',
+    );
+    expect(attemptRow.rows).toEqual([
+      {
+        provider: 'mock-primary',
+        outcome: 'timeout',
+        error_code: 'gateway_deadline_exceeded',
+      },
+    ]);
+  });
 });
 
 describe('client disconnect', () => {

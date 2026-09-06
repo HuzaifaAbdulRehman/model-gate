@@ -14,6 +14,10 @@ export interface AttemptRecord {
   /** Always false while the gateway is non-streaming: nothing reaches the client early. */
   committed: boolean;
   providerRequestId: string | null;
+  /** Streaming bytes written to the caller; null for a regular completion. */
+  bytesFlushed: number | null;
+  /** Streaming completion tokens written to the caller; null for a regular completion. */
+  tokensFlushed: number | null;
 }
 
 export interface DispatchOptions {
@@ -48,6 +52,7 @@ const TIMEOUT_CODES = new Set([
   'UND_ERR_BODY_TIMEOUT',
   'UND_ERR_CONNECT_TIMEOUT',
   'ETIMEDOUT',
+  'gateway_deadline_exceeded',
 ]);
 
 /**
@@ -94,22 +99,50 @@ export async function dispatch(
   let lastFailure: AttemptError | null = null;
   let attemptNo = 0;
 
-  // Checked before starting an attempt rather than during one. Cutting a call
-  // that is already in flight would waste the work without saving the wait.
   const outOfTime = (): boolean =>
     options.deadlineMs !== undefined && now() - startedAt >= options.deadlineMs;
 
   for (const profile of options.providers) {
     for (let tries = 0; tries < options.maxAttemptsPerProvider; tries += 1) {
       if (outOfTime()) {
-        return { success: null, failure: lastFailure ?? deadlineFailure(now() - startedAt), attempts };
+        return { success: null, failure: deadlineFailure(now() - startedAt), attempts };
       }
       attemptNo += 1;
 
+      const remainingMs =
+        options.deadlineMs === undefined ? null : options.deadlineMs - (now() - startedAt);
+      const deadlineSignal =
+        remainingMs === null
+          ? null
+          : AbortSignal.timeout(Math.max(1, Math.min(Math.ceil(remainingMs), 2_147_483_647)));
+      const signal =
+        deadlineSignal === null
+          ? options.signal
+          : options.signal === undefined
+            ? deadlineSignal
+            : AbortSignal.any([options.signal, deadlineSignal]);
+
       const result = await options.client.call(profile, request, {
         apiKey: options.apiKeys?.[profile.name],
-        signal: options.signal,
+        ...(signal === undefined ? {} : { signal }),
       });
+
+      if (deadlineSignal?.aborted === true && options.signal?.aborted !== true) {
+        const failure = deadlineFailure(now() - startedAt);
+        attempts.push({
+          attemptNo,
+          provider: profile.name,
+          outcome: 'timeout',
+          httpStatus: null,
+          errorCode: failure.code,
+          latencyMs: result.latencyMs,
+          committed: false,
+          providerRequestId: null,
+          bytesFlushed: null,
+          tokensFlushed: null,
+        });
+        return { success: null, failure, attempts };
+      }
 
       if (result.ok) {
         attempts.push({
@@ -121,6 +154,8 @@ export async function dispatch(
           latencyMs: result.latencyMs,
           committed: false,
           providerRequestId: result.providerRequestId,
+          bytesFlushed: null,
+          tokensFlushed: null,
         });
         return { success: result, failure: null, attempts };
       }
@@ -135,6 +170,8 @@ export async function dispatch(
         latencyMs: result.latencyMs,
         committed: false,
         providerRequestId: null,
+        bytesFlushed: null,
+        tokensFlushed: null,
       });
 
       if (result.disposition === 'fatal') {
@@ -146,7 +183,13 @@ export async function dispatch(
       const isLastTry = tries === options.maxAttemptsPerProvider - 1;
       if (isLastTry) break;
 
-      await sleep(retryDelay(tries, result.retryAfterMs, options.backoff));
+      const waitMs = retryDelay(tries, result.retryAfterMs, options.backoff);
+      const remainingBeforeRetry =
+        options.deadlineMs === undefined ? null : options.deadlineMs - (now() - startedAt);
+      if (remainingBeforeRetry !== null && remainingBeforeRetry <= 0) {
+        return { success: null, failure: deadlineFailure(now() - startedAt), attempts };
+      }
+      await sleep(remainingBeforeRetry === null ? waitMs : Math.min(waitMs, remainingBeforeRetry));
     }
   }
 

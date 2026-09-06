@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { Redis } from 'ioredis';
 import pg from 'pg';
 
 const execFileAsync = promisify(execFile);
@@ -53,4 +54,23 @@ export default async function setup(): Promise<void> {
     ['node_modules/node-pg-migrate/bin/node-pg-migrate.js', 'up'],
     { env: { ...process.env, DATABASE_URL: TEST_DATABASE_URL } },
   );
+
+  // A timed-out test process may never reach afterEach. Clean once before any
+  // file runs so a targeted rerun cannot inherit rows or cache entries from
+  // the failed process it is meant to diagnose.
+  const testDb = new pg.Client({ connectionString: TEST_DATABASE_URL });
+  const testCache = new Redis(TEST_REDIS_URL, {
+    lazyConnect: true,
+    enableOfflineQueue: false,
+    maxRetriesPerRequest: 2,
+  });
+  try {
+    await testDb.connect();
+    await testDb.query('TRUNCATE requests, request_payloads, request_attempts, idempotency_keys');
+    await testCache.connect();
+    await testCache.flushdb();
+  } finally {
+    await testDb.end();
+    testCache.disconnect();
+  }
 }

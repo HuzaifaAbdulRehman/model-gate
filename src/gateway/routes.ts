@@ -143,6 +143,7 @@ const TIMEOUT_CODES = new Set([
   'UND_ERR_BODY_TIMEOUT',
   'UND_ERR_CONNECT_TIMEOUT',
   'ETIMEDOUT',
+  'gateway_deadline_exceeded',
 ]);
 
 function attemptForOpenFailure(failure: AttemptError, attemptNo: number): AttemptRecord {
@@ -159,6 +160,8 @@ function attemptForOpenFailure(failure: AttemptError, attemptNo: number): Attemp
     latencyMs: failure.latencyMs,
     committed: false,
     providerRequestId: null,
+    bytesFlushed: null,
+    tokensFlushed: null,
   };
 }
 
@@ -168,7 +171,9 @@ function attemptForStream(
   attemptNo: number,
 ): AttemptRecord {
   const outcome: AttemptRecord['outcome'] =
-    result.outcome === 'truncated_clean'
+    result.deadlineExceeded
+      ? 'timeout'
+      : result.outcome === 'truncated_clean'
       ? 'truncated_clean'
       : result.outcome === 'stream_abort' || result.outcome === 'client_gone'
         ? 'stream_abort'
@@ -181,18 +186,35 @@ function attemptForStream(
     provider: opened.provider,
     outcome,
     httpStatus: opened.status,
-    errorCode: result.budgetStopped
+    errorCode: result.deadlineExceeded
+      ? 'gateway_deadline_exceeded'
+      : result.budgetStopped
       ? 'modelgate_budget_exceeded'
       : result.errorMessage === null
         ? null
         : 'upstream_stream_error',
     latencyMs: opened.latencyMs,
     committed: result.committed,
-    providerRequestId: null,
+    providerRequestId: result.providerRequestId,
+    bytesFlushed: result.bytesFlushed,
+    tokensFlushed: result.completionTokens,
   };
 }
 
 function failureFromStream(opened: StreamOpen, result: RelayResult): AttemptError {
+  if (result.deadlineExceeded) {
+    return {
+      ok: false,
+      provider: 'modelgate',
+      disposition: 'failover',
+      status: null,
+      code: 'gateway_deadline_exceeded',
+      message: 'the provider chain did not answer within the deadline',
+      retryAfterMs: null,
+      latencyMs: opened.latencyMs,
+    };
+  }
+
   return {
     ok: false,
     provider: opened.provider,
@@ -334,10 +356,57 @@ async function streamCompletion(args: {
       }
       attemptNo += 1;
 
+      const remainingMs = deps.deadlineMs - (Date.now() - chainStartedAt);
+      if (remainingMs <= 0) {
+        lastFailure = {
+          ok: false,
+          provider: 'modelgate',
+          disposition: 'failover',
+          status: null,
+          code: 'gateway_deadline_exceeded',
+          message: `the provider chain did not answer within the deadline (${Date.now() - chainStartedAt}ms)`,
+          retryAfterMs: null,
+          latencyMs: Date.now() - chainStartedAt,
+        };
+        break providerChain;
+      }
+
+      const deadlineSignal = AbortSignal.timeout(
+        Math.max(1, Math.min(Math.ceil(remainingMs), 2_147_483_647)),
+      );
+      const attemptSignal = AbortSignal.any([controller.signal, deadlineSignal]);
+
       const opened = await deps.client.openStream(profile, chatRequest, {
         apiKey: deps.apiKeys[profile.name],
-        signal: controller.signal,
+        signal: attemptSignal,
       });
+
+      if (deadlineSignal.aborted && !controller.signal.aborted) {
+        const elapsedMs = Date.now() - chainStartedAt;
+        attempts.push({
+          attemptNo,
+          provider: profile.name,
+          outcome: 'timeout',
+          httpStatus: null,
+          errorCode: 'gateway_deadline_exceeded',
+          latencyMs: opened.latencyMs,
+          committed: false,
+          providerRequestId: null,
+          bytesFlushed: null,
+          tokensFlushed: null,
+        });
+        lastFailure = {
+          ok: false,
+          provider: 'modelgate',
+          disposition: 'failover',
+          status: null,
+          code: 'gateway_deadline_exceeded',
+          message: `the provider chain did not answer within the deadline (${elapsedMs}ms)`,
+          retryAfterMs: null,
+          latencyMs: elapsedMs,
+        };
+        break providerChain;
+      }
 
       if (!opened.ok) {
         lastFailure = opened;
@@ -348,7 +417,10 @@ async function streamCompletion(args: {
 
         const isLastTry = tries === deps.maxAttemptsPerProvider - 1;
         if (isLastTry) break;
-        await delay(retryDelay(tries, opened.retryAfterMs, deps.backoff));
+        const waitMs = retryDelay(tries, opened.retryAfterMs, deps.backoff);
+        const remainingBeforeRetry = deps.deadlineMs - (Date.now() - chainStartedAt);
+        if (remainingBeforeRetry <= 0) break providerChain;
+        await delay(Math.min(waitMs, remainingBeforeRetry));
         continue;
       }
 
@@ -356,6 +428,7 @@ async function streamCompletion(args: {
         body: opened.body,
         commitDeadlineMs: deps.commitDeadlineMs,
         signal: controller.signal,
+        deadlineSignal,
         countTokens: (text) => countTokens(text),
         // Asked of the profile, because where a provider puts usage is a
         // provider fact and belongs in exactly one place.
@@ -397,9 +470,13 @@ async function streamCompletion(args: {
       // a content delta, its buffered role/error frames are discarded and the
       // next attempt can still return one clean stream with no seam.
       lastFailure = failureFromStream(opened, result);
+      if (result.deadlineExceeded) break providerChain;
       const isLastTry = tries === deps.maxAttemptsPerProvider - 1;
       if (isLastTry) break;
-      await delay(retryDelay(tries, null, deps.backoff));
+      const waitMs = retryDelay(tries, null, deps.backoff);
+      const remainingBeforeRetry = deps.deadlineMs - (Date.now() - chainStartedAt);
+      if (remainingBeforeRetry <= 0) break providerChain;
+      await delay(Math.min(waitMs, remainingBeforeRetry));
     }
   }
 
@@ -591,7 +668,7 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
           tenantId: deps.tenantId,
           idempotencyKey,
           model: chatRequest.model,
-          stream: false,
+          stream: chatRequest.stream === true,
           outcome: partial.outcome,
           httpStatus: null,
           finalProvider: partial.finalProvider,
@@ -770,23 +847,23 @@ export const gatewayRoutes: FastifyPluginAsync<GatewayDeps> = async (
 
     schedule({
       outcome: 'failed',
-      finalProvider: failure.provider,
+      finalProvider: failure.provider === 'modelgate' ? null : failure.provider,
       cacheResult: 'miss',
       tokenSource: 'estimated',
       estPromptTokens: reserve,
       attempts: result.attempts,
     });
 
-    return reply
-      .header('x-modelgate-provider', failure.provider)
-      .code(status)
-      .send({
-        error: {
-          message: failure.message,
-          type: failure.disposition === 'fatal' ? 'invalid_request_error' : 'upstream_error',
-          code: failure.code,
-        },
-      });
+    if (failure.provider !== 'modelgate') {
+      void reply.header('x-modelgate-provider', failure.provider);
+    }
+    return reply.code(status).send({
+      error: {
+        message: failure.message,
+        type: failure.disposition === 'fatal' ? 'invalid_request_error' : 'upstream_error',
+        code: failure.code,
+      },
+    });
   });
 };
 

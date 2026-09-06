@@ -55,6 +55,8 @@ guarantee breaks. Run `docker compose down` when finished.
 ## What is implemented
 
 - Retry and ordered provider failover for regular and streaming completions.
+- A hard request deadline that aborts in-flight provider work. If a stream has
+  already committed, the timeout is reported inside the stream.
 - A streaming commit point with backpressure and client-disconnect handling.
 - Explicit terminal frames for failures after the response is committed.
 - A Redis token bucket that reserves the worst case before admission and
@@ -62,13 +64,14 @@ guarantee breaks. Run `docker compose down` when finished.
 - Periodic whole-prefix token counting during streams, followed by provider
   usage when the provider sends it.
 - Exact-match, tenant-scoped completion caching.
-- PostgreSQL audit rows for the request and every provider attempt.
+- PostgreSQL audit rows for the request and every provider attempt, including
+  provider request IDs and the bytes and tokens sent during a stream.
 - Format-based redaction for credentials, contact details, payment cards,
   national identifiers and IP addresses.
 
 The test suite uses TCP mock providers that can hang, rate-limit, truncate a
 frame, close cleanly without a terminal frame, or reset a socket at a selected
-content offset. It currently contains 225 unit and integration tests. One test
+content offset. It currently contains 231 unit and integration tests. One test
 holds a downstream write open and verifies the gateway stops pulling upstream
 until the client drains.
 

@@ -118,8 +118,9 @@ export class AuditWriter {
         await client.query(
           `INSERT INTO request_attempts (
              request_id, created_at, attempt_no, provider, outcome, http_status,
-             error_code, committed, provider_request_id, latency_ms
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+             error_code, committed, provider_request_id, latency_ms,
+             bytes_flushed, tokens_flushed
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
           [
             record.requestId,
             createdAt,
@@ -131,6 +132,8 @@ export class AuditWriter {
             attempt.committed,
             attempt.providerRequestId,
             attempt.latencyMs,
+            attempt.bytesFlushed,
+            attempt.tokensFlushed,
           ],
         );
       }

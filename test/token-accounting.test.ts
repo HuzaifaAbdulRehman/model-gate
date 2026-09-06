@@ -285,6 +285,16 @@ describe('stopping a runaway generation', () => {
     expect(got.finishReason).toBe('stop');
     expect(got.events).not.toContain('error');
   });
+
+  it('allows a small tokenizer disagreement at the requested limit', async () => {
+    open = await harness();
+    const got = await stream(open.url, { max_tokens: 24 });
+
+    expect(countTokens(got.text)).toBe(25);
+    expect(got.text).toBe([...contentPieces(1, 24)].join(''));
+    expect(got.finishReason).toBe('stop');
+    expect(got.events).not.toContain('error');
+  });
 });
 
 describe('the budget after a stream', () => {
